@@ -19,6 +19,8 @@ from agent_env.providers.sandbox_providers.modal_sandbox import ModalSandboxProv
 from agent_env.providers.sandbox_providers.modal_vm_sandbox import ModalVmSandboxProvider
 from agent_env.providers.sandbox_providers.sail_vm import _sdk as sail_sdk
 from agent_env.providers.sandbox_providers.sail_vm.provider import SailVmSandboxProvider
+from agent_env.providers.sandbox_providers.smol_vm import provider as smol_module
+from agent_env.providers.sandbox_providers.smol_vm.provider import SmolVmSandboxProvider
 from agent_env.providers.sandbox_providers.sandbox import Sandbox
 from agent_env.providers.sandbox_providers.sandbox_provider import _BUILTIN_SANDBOX_PROVIDERS
 from agent_env.providers.sandbox_providers.tenki.provider import TenkiSandboxProvider
@@ -107,6 +109,15 @@ async def _tenki() -> Sandbox:
     client.create = AsyncMock(return_value=session)
     provider = TenkiSandboxProvider(api_key="test-key", client_cls=MagicMock(return_value=client))
     return await provider.create_vm(exposed_ports=[], setup_for_gateway=False)
+async def _smol_vm() -> Sandbox:
+    machine = MagicMock(id="agentenv-test")
+    with (
+        patch.object(smol_module, "Machine", SimpleNamespace(create=lambda config, conn: machine)),
+        patch.object(smol_module, "_host_port", return_value=44112),
+        patch.object(SmolVmSandboxProvider, "_setup_docker", new_callable=AsyncMock),
+        patch.object(SmolVmSandboxProvider, "_configure_host_access", new_callable=AsyncMock),
+    ):
+        return await SmolVmSandboxProvider().create_vm(exposed_ports=[])
 
 
 FACTORIES = {
@@ -116,6 +127,7 @@ FACTORIES = {
     "sail_vm": _sail,
     "tensorlake": _tensorlake,
     "tenki": _tenki,
+    "smol_vm": _smol_vm,
     "local": _local,
 }
 
