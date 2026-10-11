@@ -217,6 +217,10 @@ class AgentEnvApplication(ABC):
 class AgentEnvFastMCPApplication(AgentEnvApplication):
     supports_tools: ClassVar[bool] = True
     _hook: Callable | None = None
+    #: How this app's tool calls get their ToolContext, decided by ``_check_tool_binding``: ``"dispatch"`` wraps
+    #: mcp FastMCP's tool manager, ``"middleware"`` joins a fastmcp app's middleware chain, None leaves them unbound.
+    _binding: str | None = None
+    _middleware: Any = None
 
     def _add_route(self, app: Any, path: str, methods: list, handler: Callable) -> None:
         app.custom_route(path, methods=methods)(handler)
@@ -225,23 +229,53 @@ class AgentEnvFastMCPApplication(AgentEnvApplication):
         app.tool(name=descriptor.name, description=descriptor.description)(injecting(fn))
 
     def _check_tool_binding(self, app: Any) -> None:
-        """Refuse before any route or tool is added: an app without the dispatch the binding wraps (its tool
-        calls would run unbound, which nothing reading ``ToolContext.current()`` can tell from an empty
-        caller), a dispatch this protocol already wraps (one handler per app, or the second hook would answer
-        the first handler's tools) and an ``on_tool_call`` of the wrong shape. The hook is kept for
-        ``_bind_tool_calls``."""
-        manager = getattr(app, "_tool_manager", None)
-        if not (callable(getattr(manager, "call_tool", None)) and callable(getattr(manager, "get_tool", None))):
-            raise RuntimeError(
-                "this app has no FastMCP tool dispatch to bind a ToolContext around "
-                "(mcp>=1.25,<2 keeps it at FastMCP._tool_manager); "
-                "an app that serves no tools mounts through AgentEnvStarletteApplication"
-            )
-        if getattr(manager.call_tool, _TOOL_CONTEXT_BOUND_ATTR, False):
-            raise RuntimeError("this FastMCP app already carries an AgentEnv tool dispatch; mount one handler per app")
+        """Decide, before any route or tool is added, how every tools/call on ``app`` gets its ToolContext, and
+        refuse what cannot be honoured. The standalone ``fastmcp`` package (a ``middleware`` list with
+        ``add_middleware``) is joined through that public chain, checked first because its 2.x line also keeps a
+        tool manager whose dispatch has another shape; mcp's own FastMCP (``mcp>=1.25,<2``) has no public hook,
+        so its tool manager's ``call_tool`` is wrapped. An app with neither cannot bind: mounting it is refused
+        when the handler declared that it reads the context (a ``ToolContext`` parameter or an ``on_tool_call``),
+        since an empty caller would then be a lie nothing can detect, and goes ahead unbound, with a warning,
+        otherwise. A dispatch this protocol already wraps is refused either way (one handler per app, or the
+        second hook would answer the first handler's tools), an ``on_tool_call`` of the wrong shape fails here,
+        not per call, and so does a fastmcp that cannot be imported: nothing has been added to the app yet."""
         self._hook = _tool_call_hook(self.handler)
+        middleware = getattr(app, "middleware", None)
+        if isinstance(middleware, list) and callable(getattr(app, "add_middleware", None)):
+            if any(getattr(entry, _TOOL_CONTEXT_BOUND_ATTR, False) for entry in middleware):
+                raise RuntimeError("this fastmcp app already carries an AgentEnv tool-context middleware; mount one handler per app")
+            self._middleware = _tool_context_middleware(self._hook)
+            self._binding = "middleware"
+            return
+        manager = getattr(app, "_tool_manager", None)
+        if callable(getattr(manager, "call_tool", None)) and callable(getattr(manager, "get_tool", None)):
+            if getattr(manager.call_tool, _TOOL_CONTEXT_BOUND_ATTR, False):
+                raise RuntimeError("this FastMCP app already carries an AgentEnv tool dispatch; mount one handler per app")
+            self._binding = "dispatch"
+            return
+        readers = [descriptor.name for descriptor, fn in self._tools if _tool_context_slot(fn)]
+        if readers or self._hook is not None:
+            raise RuntimeError(
+                "this app has no tool dispatch to bind a ToolContext around (mcp>=1.25,<2 keeps one at "
+                f"FastMCP._tool_manager; fastmcp exposes a middleware list), and {', '.join(readers) or 'on_tool_call'} "
+                "would read an empty caller"
+            )
+        self._binding = None
+        logger.warning(
+            "%s.%s (environment %r): no tool dispatch to bind a ToolContext around, so its tool calls run with an "
+            "empty caller; build the app with create_fastmcp_app or on fastmcp to bind one",
+            type(app).__module__, type(app).__qualname__, self.environment_card.name,
+        )
 
     def _bind_tool_calls(self, app: Any) -> None:
+        """Bind as ``_check_tool_binding`` decided. First in fastmcp's middleware list runs outermost, so a
+        handler's own middleware and the tool both run under the binding, the same layering as the wrap."""
+        if self._binding == "dispatch":
+            self._bind_tool_dispatch(app)
+        elif self._binding == "middleware":
+            app.middleware.insert(0, self._middleware)
+
+    def _bind_tool_dispatch(self, app: Any) -> None:
         """Wrap the tool manager's ``call_tool``, which every tools/call resolves at call time, so each call
         of a registered tool runs under its ToolContext and the handler's ``on_tool_call`` may answer
         it first. An unknown tool name goes straight to the dispatch, whose error answers it. FastMCP
@@ -337,9 +371,10 @@ class AgentEnvEnvironment:
         """Runs before every tools/call on this environment's app, under the bound ``context``.
 
         Return None to let the call proceed, or an ``mcp.types.CallToolResult`` (``isError=True`` for
-        a refusal) to answer the call without running the tool; it reaches the wire verbatim, before
-        output validation. Anything else raises TypeError. May be ``async``. Not invoked for
-        extension (REST) routes.
+        a refusal) to answer the call without running the tool. On mcp's FastMCP it reaches the wire
+        verbatim, before output validation; on a fastmcp app it passes through fastmcp's output validation,
+        so a non-error answer there must fit the tool's declared output, while a refusal passes unchanged.
+        Anything else raises TypeError. May be ``async``. Not invoked for extension (REST) routes.
         """
         return None
 
@@ -554,6 +589,47 @@ def _check_call_tool_result(value: Any) -> None:
     result_type = getattr(sys.modules.get("mcp.types"), "CallToolResult", None)
     if result_type is None or not isinstance(value, result_type):
         raise TypeError(f"on_tool_call must return None or mcp.types.CallToolResult, got {type(value).__name__}")
+
+
+def _tool_context_middleware(hook: Callable | None) -> Any:
+    """A fastmcp ``Middleware`` that runs every tools/call under its ToolContext, the handler's ``on_tool_call``
+    first. A ``Middleware`` subclass rather than a bare ``(context, call_next)`` callable because fastmcp runs the
+    typed ``on_call_tool`` exactly once per call, where a bare callable runs once per dispatch phase. fastmcp is
+    not a dependency of this package: it is imported here, where an app built with it has just been handed over."""
+    try:
+        from fastmcp.server.middleware import Middleware
+    except ImportError as e:
+        raise RuntimeError("this app carries a fastmcp middleware list but fastmcp cannot be imported") from e
+
+    class ToolContextMiddleware(Middleware):
+        async def on_call_tool(self, context: Any, call_next: Callable) -> Any:
+            message = context.message
+            arguments = dict(getattr(message, "arguments", None) or {})
+            with bound(context_from_mcp(context.fastmcp_context, message.name, arguments)) as tool_context:
+                if hook is not None:
+                    answer = await _maybe_await(hook(tool_context))
+                    if answer is not None:
+                        _check_call_tool_result(answer)
+                        return _fastmcp_tool_result(answer)
+                return await call_next(context)
+
+    middleware = ToolContextMiddleware()
+    setattr(middleware, _TOOL_CONTEXT_BOUND_ATTR, True)
+    return middleware
+
+
+def _fastmcp_tool_result(answer: Any) -> Any:
+    """A hook's ``mcp.types.CallToolResult`` as the ``ToolResult`` a fastmcp middleware chain returns, the error
+    flag kept, under the field spellings of mcp 1 and 2."""
+    from fastmcp.tools import ToolResult
+    # mcp 2's spellings first: on mcp 1 they are plain misses, on mcp 2 the camel-case ones are deprecation shims.
+    structured = getattr(answer, "structured_content", None)
+    if structured is None:
+        structured = getattr(answer, "structuredContent", None)
+    is_error = getattr(answer, "is_error", None)
+    if is_error is None:
+        is_error = getattr(answer, "isError", False)
+    return ToolResult(content=list(answer.content), structured_content=structured, is_error=bool(is_error))
 
 
 def _schema_from_signature(fn: Callable) -> dict:
