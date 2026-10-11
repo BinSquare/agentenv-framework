@@ -175,6 +175,7 @@ class LocalSandbox(VmSandbox):
     """
 
     ON_THIS_MACHINE = True
+    platform = None  # this machine's Docker runs its own platform, and emulates others where it's set up
 
     def url_from_sandbox(self, url: str) -> str:
         return LocalSandboxProvider.get_external_url(url)
@@ -537,9 +538,6 @@ class LocalSandboxProvider(SandboxProvider):
 
     EXTRA_CONTAINER_RUN_ARGS = " ".join(f"--add-host {entry}" for entry in _EXTRA_HOSTS)
     ON_THIS_MACHINE = True
-    # A sandbox or a container is a container from the image's name, which this machine's Docker pulls or already
-    # holds; a VM it creates (create_vm) loads images of its own.
-    CREATES_VMS = True
 
     def url_from_sandbox(self, url: str) -> str:
         return self.get_external_url(url)

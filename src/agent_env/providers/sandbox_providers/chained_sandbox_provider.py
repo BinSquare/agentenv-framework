@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from agent_env.attribution import Attribution
-from agent_env.providers.sandbox_providers.sandbox import NetworkPolicy, NetworkPolicyUnsupportedError, Sandbox
-from agent_env.providers.sandbox_providers.sandbox_provider import SandboxProvider
+from agent_env.providers.sandbox_providers.sandbox import NetworkPolicy, NetworkPolicyUnsupportedError, Sandbox, VmSandbox
+from agent_env.providers.sandbox_providers.sandbox_provider import SANDBOX_MODE_VM, SandboxProvider
 
 if TYPE_CHECKING:
     from agent_env.artifact.artifacts.docker_image import DockerImageArtifact
@@ -39,19 +40,13 @@ class ChainedSandboxProvider(SandboxProvider):
         """``providers`` that can enforce ``policy``, so an incapable one is never called."""
         if policy is None or not policy.restricts_egress:
             return providers
-        eligible: list[SandboxProvider] = []
-        for p in providers:
-            if p.supports_network_policy(policy):
-                eligible.append(p)
-            else:
-                log = logger.warning if p is providers[0] else logger.info
-                log(f"sandbox_provider_skipped provider={type(p).__name__} mode={policy.mode.value}")
-        if not eligible:
-            raise NetworkPolicyUnsupportedError(
+        return _without(
+            providers,
+            lambda p: None if p.supports_network_policy(policy) else f"can't enforce network policy mode {policy.mode.value!r}",
+            lambda refused: NetworkPolicyUnsupportedError(
                 f"No sandbox backend can enforce network policy mode {policy.mode.value!r} "
-                f"(providers: {[type(p).__name__ for p in providers]})"
-            )
-        return eligible
+                f"(providers: {[type(p).__name__ for p in providers]})"),
+        )
 
     def supports_network_policy(self, policy: NetworkPolicy) -> bool:
         return any(p.supports_network_policy(policy) for p in self._providers)
@@ -80,6 +75,17 @@ class ChainedSandboxProvider(SandboxProvider):
             except Exception as e:
                 logger.warning(f"{name}.create_sandbox failed: {e}; trying next provider")
                 errors.append((name, e))
+                continue
+            # The deploy loads the image into a VM, which refuses one it can't get or run; the next provider's may not.
+            if (image is not None and sandbox.mode == SANDBOX_MODE_VM and isinstance(sandbox, VmSandbox)
+                    and (problems := sandbox.load_problems([image]))):
+                problem = "; ".join(problems)
+                logger.warning(f"{name}.create_sandbox gave a VM that can't load the image: {problem}; trying next provider")
+                errors.append((name, ValueError(problem)))
+                try:
+                    await sandbox.terminate()
+                except Exception as e:
+                    logger.warning(f"{name}: terminating sandbox {sandbox.sandbox_id} failed: {e}")
                 continue
             logger.info(
                 f"chain_provider_attempt provider={name} status=success sandbox_type={sandbox.type} "
@@ -113,3 +119,27 @@ class ChainedSandboxProvider(SandboxProvider):
                 await p.close()
             except Exception as e:
                 logger.warning(f"close() failed on {type(p).__name__}: {e}")
+
+
+def skip_refusing(provider: SandboxProvider, problem: Callable[[SandboxProvider], str | None], *, what: str
+                  ) -> SandboxProvider:
+    """``provider``, less each of its links ``problem`` refuses, as a deploy of ``what`` runs on any link that takes it.
+    ``problem`` says why a link refuses as a clause on its name ("which ..."); a ValueError naming each is raised when
+    it refuses every link."""
+    links = list(provider.links)
+    running = _without(links, problem, lambda refused: ValueError(f"Can't deploy {what} " + "; nor ".join(
+        f"with {type(link).__name__}, {reason}" for link, reason in refused)))
+    return provider if len(running) == len(links) else ChainedSandboxProvider(running)
+
+
+def _without(providers: list[SandboxProvider], problem: Callable[[SandboxProvider], str | None],
+             refuse: Callable[[list[tuple[SandboxProvider, str]]], Exception]) -> list[SandboxProvider]:
+    """``providers`` less each one ``problem`` refuses, skipped with a warning when it's the first, the one preferred,
+    and noted otherwise; ``refuse(refusals)`` is raised when it refuses them all."""
+    refused = [(p, reason) for p in providers if (reason := problem(p))]
+    if refused and len(refused) == len(providers):
+        raise refuse(refused)
+    for p, reason in refused:
+        log = logger.warning if p is providers[0] else logger.info
+        log(f"sandbox_provider_skipped provider={type(p).__name__}: {reason}")
+    return [p for p in providers if all(p is not refusing for refusing, _ in refused)]

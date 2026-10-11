@@ -69,8 +69,8 @@ def test_equal_sources_give_equal_digests_and_bytes(local_stores, context):
 def test_a_context_only_image_is_built_and_refused_where_run_by_name(local_stores, context):
     image = DockerImageArtifact.put_context("a", description="d", context_path=str(context), dockerfile_path="Dockerfile")
 
-    assert image.context_only and image.load_problem() is None
-    assert image.by_name_problem() == "'a' v1 is only a build context, which has to be built, not pulled"
+    assert image.context_only and image.load_problem(on_this_machine=False) is None
+    assert image.by_name_problem(on_this_machine=False) == "'a' v1 is only a build context, which has to be built, not pulled"
     with pytest.raises(ValueError, match="has no tar.gz; its image is built from its build context"):
         image.load()
 
@@ -165,3 +165,13 @@ def test_put_records_the_platform_it_built_for_when_none_is_given(local_stores, 
 
     assert (native.platform, explicit.platform) == ("linux/arm64", "linux/amd64")
     assert native.source_digest != explicit.source_digest
+
+
+
+def test_a_put_records_the_platform_as_docker_build_names_it(local_stores, context):
+    image = DockerImageArtifact.put_context("a", description="d", context_path=str(context), dockerfile_path="Dockerfile",
+                                            platform="linux/arm64/v8")
+    named = DockerImageArtifact.put_context("b", description="d", context_path=str(context), dockerfile_path="Dockerfile",
+                                            platform="linux/arm64")
+
+    assert image.platform == "linux/arm64" and image.source_digest == named.source_digest

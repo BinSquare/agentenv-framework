@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import shlex
-from abc import ABC, abstractmethod
+from abc import ABC
 from enum import Enum
 from typing import TYPE_CHECKING, Any, ClassVar, Optional, Self
 from urllib.parse import urlparse
@@ -44,19 +44,19 @@ class Accepts(Enum):
     NAME = "name"  # one it starts by its name, which an image that is only a build context gets only from a build
     NAME_OR_CONTEXT = "name_or_context"  # one it starts by its name, or a build context it builds first (prepare_image)
 
-    def problem(self, image: DockerImageArtifact) -> str | None:
-        """Why a provider that accepts these can't run ``image``, or None when it can."""
+    def problem(self, image: DockerImageArtifact, *, on_this_machine: bool) -> str | None:
+        """Why a provider that accepts these, whose sandboxes run ``on_this_machine`` or elsewhere, can't run ``image``,
+        or None when it can: one elsewhere can't pull from a registry on this machine."""
         if self is Accepts.LOADABLE:
-            return image.load_problem()
-        if self is Accepts.NAME:
-            return image.by_name_problem()
-        return None
+            return image.load_problem(on_this_machine=on_this_machine)
+        if self is Accepts.NAME_OR_CONTEXT and image.context_only:
+            return None  # the provider builds it
+        return image.by_name_problem(on_this_machine=on_this_machine)
 
 
 class SandboxProvider(ABC):
     """Compute backend that provisions sandboxes. Selected via [sandbox] default / build_sandbox_provider(); swap via set_sandbox_provider()."""
 
-    @abstractmethod
     async def create_sandbox(
         self,
         *,
@@ -69,7 +69,8 @@ class SandboxProvider(ABC):
         timeout: int = 3600 * 2,
         attribution: Optional[Attribution] = None,
         network_policy: Optional[NetworkPolicy] = None,
-    ) -> Sandbox: ...
+    ) -> Sandbox:
+        raise NotImplementedError(f"{type(self).__name__} does not support create_sandbox")
 
     async def create_vm(
         self,
@@ -166,18 +167,26 @@ class SandboxProvider(ABC):
     URL_REWRITES: ClassVar[dict[str, str]] = {}
 
     # What it declares, which nothing outside the providers reads any other way. A provider that declares nothing runs
-    # each image from its name, in a sandbox that isn't on this machine, and creates no VM and no private network.
+    # each image from its name, in a sandbox that isn't on this machine, on linux/amd64, and creates no VM and no
+    # private network.
     #
     # Whether its sandboxes run on this machine: an image only this machine holds (in a registry or object store on
     # it) reaches them, its containers need this machine's Docker, and a gateway's infra envs are built here for it.
     ON_THIS_MACHINE: ClassVar[bool] = False
-    # Whether create_vm gives a VM sandbox, as a provider that implements it does.
-    CREATES_VMS: ClassVar[bool] = False
+    # The sandbox modes it creates, derived for each provider class from what it implements (``__init_subclass__``):
+    # SANDBOX_MODE_CONTAINER when it implements create_sandbox, SANDBOX_MODE_VM when it implements create_vm.
+    SUPPORTED_SANDBOX_MODES: ClassVar[frozenset[str]] = frozenset()
     # The images create_sandbox and create_container run.
     SANDBOX_ACCEPTS: ClassVar[Accepts] = Accepts.NAME
     CONTAINER_ACCEPTS: ClassVar[Accepts] = Accepts.NAME
     # Whether create_container(private_network=True) puts containers on a network they share.
     PRIVATE_NETWORK: ClassVar[bool] = False
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        cls.SUPPORTED_SANDBOX_MODES = frozenset(
+            mode for mode, method in ((SANDBOX_MODE_CONTAINER, "create_sandbox"), (SANDBOX_MODE_VM, "create_vm"))
+            if getattr(cls, method) is not getattr(SandboxProvider, method))
 
     @property
     def links(self) -> tuple[SandboxProvider, ...]:
@@ -300,9 +309,16 @@ def _build_registry(source: Config | None = None) -> dict[str, dict]:
 
 def _validate_plugin(name: str, loaded: Any) -> type[SandboxProvider]:
     cls = _registration.require_subclass(loaded, SandboxProvider)
-    if problem := _registration.unimplemented(cls, SandboxProvider):
+    if problem := _unimplemented(cls):
         raise TypeError(problem)
     return cls
+
+
+def _unimplemented(cls: type[SandboxProvider]) -> str | None:
+    """What ``cls`` still has to implement to work as a sandbox provider, if anything: a sandbox mode at least,
+    create_sandbox or create_vm."""
+    return _registration.unimplemented(cls, SandboxProvider) or (
+        None if cls.SUPPORTED_SANDBOX_MODES else f"{cls.__qualname__} must implement create_sandbox or create_vm")
 
 
 def _get_sandbox_registry() -> dict[str, dict]:
@@ -356,7 +372,7 @@ def _merge_config_toml_sandbox_providers(
         if not impl:
             raise ConfigError(f"config.toml sandbox provider {name!r} is missing an 'impl' dotted path")
         cls = load_impl(impl, SandboxProvider)
-        if problem := _registration.unimplemented(cls, SandboxProvider):
+        if problem := _unimplemented(cls):
             raise ConfigError(f"{where} impl {impl!r}: {problem}")
         if from_plugins.refuse(name, where):
             continue

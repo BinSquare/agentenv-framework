@@ -26,7 +26,7 @@ from agent_env.store.image_store.local_registry_image_store import LocalRegistry
 from agent_env.store.image_store.oci_registry_credentials import is_loopback_host, names_registry, registry_host_from_ref
 from agent_env.store.image_store.registry_api import pin_digest
 from agent_env.utils.build_context import BuildContext
-from agent_env.utils.docker_build import DEFAULT_BUILD_PLATFORM
+from agent_env.utils.docker_build import DEFAULT_BUILD_PLATFORM, normalize_platform
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +125,7 @@ class DockerImageArtifact(Artifact):
         image_ref = image_store.image_ref(repository, f"v{version}")
         image_store.ensure_repository(repository)
         _push_local_image(image_name, image_ref, image_store)
-        platform = platform or _image_platform(image_ref)
+        platform = normalize_platform(platform) if platform else _image_platform(image_ref)
 
         with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
             tmp_path = Path(tmp.name)
@@ -198,7 +198,7 @@ class DockerImageArtifact(Artifact):
             tar_gz_object_url=tar_gz_object_url,
             build_context_object_url=build_context_object_url,
             dockerfile_path=dockerfile_path,
-            platform=platform,
+            platform=normalize_platform(platform) if platform else None,
             source_digest=source_digest,
         )
         return store.put_document(instance)
@@ -238,6 +238,7 @@ class DockerImageArtifact(Artifact):
         from agent_env.artifact.store import get_artifact_store
         from agent_env.config import get_config
 
+        platform = normalize_platform(platform)
         root = Path(context_path)
         dockerfile = _resolve_dockerfile(root, dockerfile_path)
         if not dockerfile.is_file():
@@ -274,21 +275,33 @@ class DockerImageArtifact(Artifact):
         tag the image's build gives it."""
         return bool(self.build_context_object_url) and not self.tar_gz_object_url and not names_registry(self.image_name)
 
-    def load_problem(self) -> str | None:
-        """Why no VM sandbox can get this image, or None when one can: a tar.gz is loaded, an image with none is pulled
-        when its name names a registry, and built from its build context when it has only that."""
-        if self.tar_gz_object_url or names_registry(self.image_name) or self.context_only:
-            return None
+    def load_problem(self, *, on_this_machine: bool, platform: str | None = None) -> str | None:
+        """Why a VM sandbox can't get this image, or None when it can: a tar.gz is loaded, an image with none is pulled
+        when its name names a registry, one that a VM ``on_this_machine`` or not reaches, and built from its build
+        context when it has only that; and a VM of ``platform`` runs only an image built for it."""
+        if self.tar_gz_object_url or self.context_only:
+            return self.platform_problem(platform)
+        if names_registry(self.image_name):
+            return pull_problem(self.image_name, on_this_machine=on_this_machine) or self.platform_problem(platform)
         return (f"{self.id!r} v{self.version} has no tar.gz, and its image name {self.image_name!r} doesn't name a "
                 "registry to pull it from")
 
-    def by_name_problem(self) -> str | None:
+    def by_name_problem(self, *, on_this_machine: bool) -> str | None:
         """Why a sandbox that runs an image by pulling its name can't run this one, or None when it can: a context-only
         image's name is a tag only its build gives it, a VM sandbox's or Modal's, and pulled, it would be looked up on
-        Docker Hub."""
+        Docker Hub; and a sandbox not ``on_this_machine`` can't pull from a registry on this machine."""
         if self.context_only:
             return f"{self.id!r} v{self.version} is only a build context, which has to be built, not pulled"
-        return None
+        return pull_problem(self.image_name, on_this_machine=on_this_machine)
+
+    def platform_problem(self, platform: str | None) -> str | None:
+        """Why a sandbox that runs images of ``platform`` can't run this one, or None when it can: an image runs on the
+        platform it records, the one it's built for, however either is spelled (``normalize_platform``). One that
+        records none, or a sandbox that runs any (None), isn't checked."""
+        if platform is None or self.platform is None or normalize_platform(self.platform) == normalize_platform(platform):
+            return None
+        return (f"{self.id!r} v{self.version} is a {self.platform} image, and the sandbox runs {platform}; rebuild it for "
+                f"{platform}, which a Linux host of another platform does only with QEMU emulation set up")
 
     @classmethod
     async def put_from_github(
@@ -466,6 +479,14 @@ class DockerImageArtifact(Artifact):
         return DockerImageArtifact._GitHubURLParts(owner=owner, repo=repo, ref=ref, path=path)
 
 
+def pull_problem(image_name: str, *, on_this_machine: bool) -> str | None:
+    """Why a sandbox pulling ``image_name`` can't, or None when it can: one that isn't ``on_this_machine`` can't reach a
+    registry on this machine."""
+    if on_this_machine or not is_loopback_host(registry_host_from_ref(image_name)):
+        return None
+    return f"{image_name} is in a registry on this machine, which a sandbox elsewhere can't pull from"
+
+
 def refuse_local_github_build(entity_id: str) -> None:
     """A GitHub build publishes to the configured registry, so it takes a registry id; an ``@local``
     image is built from its own Dockerfile."""
@@ -538,9 +559,7 @@ def _image_platform(image_ref: str) -> str | None:
                             capture_output=True, text=True)
     if result.returncode != 0 or result.stdout.count("/") != 2:
         return None
-    os_name, architecture, variant = result.stdout.strip().split("/")
-    # arm64 has one variant, so it goes unnamed as in `--platform linux/arm64`; 32-bit arm's v6 and v7 differ.
-    return f"{os_name}/{architecture}/{variant}" if architecture == "arm" and variant else f"{os_name}/{architecture}"
+    return normalize_platform(result.stdout)
 
 
 def _resolve_dockerfile(context_dir: Path, dockerfile_path: str | None) -> Path | None:

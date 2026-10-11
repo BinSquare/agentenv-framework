@@ -152,6 +152,10 @@ class Sandbox(ABC):
 
     # Whether it runs on this machine, as a local sandbox does.
     ON_THIS_MACHINE: ClassVar[bool] = False
+    # The platform of the images it runs, as an image records the one it's built for: linux/amd64, what agent-env
+    # builds for, unless its provider sets another when it creates it. None runs any, unchecked, as a local sandbox
+    # does, whose Docker runs this machine's platform and emulates others where it's set up.
+    platform: str | None = DEFAULT_BUILD_PLATFORM
     # The host other containers on its provider's private network reach it at, ready for a URL; None when it's on none.
     private_host: str | None = None
 
@@ -290,11 +294,12 @@ class VmSandbox(Sandbox):
 
     async def load_docker_images(self, artifacts: list) -> None:
         """Put each DockerImageArtifact's image on the VM: those with a tar.gz are loaded from it, in parallel, those
-        with only a build context are built from it, and the rest are pulled by image name. An image no sandbox can get
-        is refused before anything is loaded."""
+        with only a build context are built from it, and the rest are pulled by image name. An image this VM can't get,
+        such as one to pull from a registry on this machine when the VM isn't on it, or can't run, being built for
+        another platform than its own, is refused before anything is loaded."""
         if not artifacts:
             return
-        if problems := [problem for artifact in artifacts if (problem := artifact.load_problem())]:
+        if problems := self.load_problems(artifacts):
             raise RuntimeError(f"Can't load images: {'; '.join(problems)}")
         if tarballs := [artifact for artifact in artifacts if artifact.tar_gz_object_url]:
             await self._load_tarballs(tarballs)
@@ -304,6 +309,13 @@ class VmSandbox(Sandbox):
         if built := [artifact for artifact in artifacts if artifact.context_only]:
             await self.build_images(built)
 
+    def load_problems(self, artifacts: list) -> list[str]:
+        """Why this VM can't get or run each DockerImageArtifact it can't, as ``load_docker_images`` refuses them: one
+        to pull from a registry on this machine when the VM isn't on it, one with no tar.gz whose name names no
+        registry, or one built for another platform than its own."""
+        return [problem for artifact in artifacts
+                if (problem := artifact.load_problem(on_this_machine=self.ON_THIS_MACHINE, platform=self.platform))]
+
     async def build_images(self, artifacts: list) -> None:
         """Build each context-only image from its build context, one build at a time, so heavy builds don't contend
         for one VM; images with the same ``source_digest`` share a build. The build pulls its base images and packages
@@ -311,14 +323,16 @@ class VmSandbox(Sandbox):
         builds: dict[str, list] = {}
         for artifact in artifacts:
             builds.setdefault(artifact.source_digest or artifact.build_context_object_url, []).append(artifact)
-        for source, images in builds.items():
-            await self._build_image(source, images)
+        for images in builds.values():
+            await self._build_image(images)
 
-    async def _build_image(self, source: str, images: list) -> None:
-        """Download the context ``images`` share, extract it, and ``docker build`` it, tagged with each image's name."""
+    async def _build_image(self, images: list) -> None:
+        """Download the context ``images`` share, extract it, and ``docker build`` it, tagged with each image's name.
+        The work folder is this build's own, since a host can run builds of one context at once: two of the local
+        provider's sandboxes, or two deploys onto one VM."""
         first = images[0]
         names = list(dict.fromkeys(image.image_name for image in images))
-        work = f"/tmp/agent-env-build-{hashlib.sha256(source.encode()).hexdigest()[:16]}"
+        work = f"/tmp/agent-env-build-{uuid.uuid4().hex}"
         platform = first.platform or DEFAULT_BUILD_PLATFORM
         tags = " ".join(f"-t {shlex.quote(name)}" for name in names)
         logger.info(f"Building {', '.join(names)} from its build context, for {platform}...")

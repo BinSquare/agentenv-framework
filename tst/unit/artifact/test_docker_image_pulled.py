@@ -16,7 +16,7 @@ def test_a_document_with_no_tar_gz_is_read(document):
     image = DockerImageArtifact.model_validate(document)
 
     assert image.tar_gz_object_url is None
-    assert image.load_problem() is None
+    assert image.load_problem(on_this_machine=False) is None
 
 
 def test_one_is_written_with_both_spellings_of_its_tar_gz_empty_and_reads_back_the_same():
@@ -39,7 +39,23 @@ def test_one_is_written_with_both_spellings_of_its_tar_gz_empty_and_reads_back_t
 def test_an_image_loads_from_its_tar_gz_or_by_pulling_a_name_that_names_its_registry(image_name, tar_gz, problem):
     image = DockerImageArtifact(id="img", version=1, description="d", image_name=image_name, tar_gz_object_url=tar_gz)
 
-    assert image.load_problem() == problem
+    assert image.load_problem(on_this_machine=True) == problem
+
+
+@pytest.mark.parametrize("image_name", ["localhost:5000/img:v1", "127.0.0.1:5000/img:v1"])
+def test_a_sandbox_elsewhere_cant_pull_from_this_machines_registry(image_name):
+    image = DockerImageArtifact(id="img", version=1, description="d", image_name=image_name)
+    here = f"{image_name} is in a registry on this machine, which a sandbox elsewhere can't pull from"
+
+    assert (image.load_problem(on_this_machine=True), image.by_name_problem(on_this_machine=True)) == (None, None)
+    assert image.load_problem(on_this_machine=False) == image.by_name_problem(on_this_machine=False) == here
+
+
+def test_a_vm_elsewhere_loads_the_tar_gz_of_an_image_named_for_this_machines_registry():
+    image = DockerImageArtifact(id="img", version=1, description="d", image_name="localhost:5000/img:v1",
+                                tar_gz_object_url="file:///state/img.tar.gz")
+
+    assert image.load_problem(on_this_machine=False) is None
 
 
 def test_one_with_no_tar_gz_has_no_bytes_to_load():

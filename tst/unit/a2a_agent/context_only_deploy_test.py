@@ -1,5 +1,7 @@
 """An agent whose image is only a build context deploys only where it's built, in a VM or by Modal: a provider that runs an
-agent in a container by its image's name refuses it before creating anything, and Modal is told of it first."""
+agent in a container by its image's name refuses it before creating anything, and Modal is told of it first. An image a
+provider can't get otherwise, such as one a sandbox elsewhere would pull from this machine's registry, is refused before
+anything is created too."""
 
 import pytest
 
@@ -22,7 +24,6 @@ class _LocalProvider(LocalSandboxProvider):
 
 
 class _VmProvider(SandboxProvider):
-    CREATES_VMS = True
     SANDBOX_ACCEPTS = Accepts.LOADABLE
 
     async def create_sandbox(self, **_):
@@ -59,16 +60,32 @@ def litellm(monkeypatch):
     monkeypatch.setenv("LITELLM_BASE_URL", "http://litellm.example/v1")
 
 
+BY_NAME = ("with _LocalProvider, which runs an agent's image by name: 'solver-image' v2 is only a build context, which has "
+           "to be built, not pulled")
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("provider", [_LocalProvider(), ChainedSandboxProvider([_VmProvider(), _LocalProvider()])],
-                         ids=["local", "chain-with-local"])
-async def test_a_provider_that_runs_the_agent_by_name_refuses_it(monkeypatch, local_stores, litellm, provider):
+@pytest.mark.parametrize("provider, refusal", [
+    (_LocalProvider(), BY_NAME),
+    (ChainedSandboxProvider([_LocalProvider(), _LocalProvider()]), f"{BY_NAME}; nor {BY_NAME}"),
+], ids=["local", "chain-of-locals"])
+async def test_a_provider_that_runs_the_agent_by_name_refuses_it(monkeypatch, local_stores, litellm, provider, refusal):
     monkeypatch.setattr(sandbox_provider, "build_sandbox_provider", lambda name: provider)
 
-    with pytest.raises(ValueError, match="Can't deploy agent 'solver' with _LocalProvider, which runs an agent's image by "
-                                         "name: 'solver-image' v2 is only a build context, which has to be built, not "
-                                         "pulled"):
+    with pytest.raises(ValueError, match=f"Can't deploy agent 'solver' {refusal}"):
         await A2AAgent(id="solver", version=1, docker_image_artifact=IMAGE).deploy(sandbox_type="any")
+
+
+@pytest.mark.asyncio
+async def test_a_chain_skips_a_provider_that_runs_the_agent_by_name_for_one_that_builds_it(monkeypatch, local_stores,
+                                                                                           litellm, caplog):
+    monkeypatch.setattr(sandbox_provider, "build_sandbox_provider",
+                        lambda name: ChainedSandboxProvider([_LocalProvider(), _VmProvider()]))
+
+    with pytest.raises(RuntimeError, match=r"All 1 providers failed: _VmProvider: _Created\(\)"):
+        await A2AAgent(id="solver", version=1, docker_image_artifact=IMAGE).deploy(sandbox_type="any")
+    assert ("sandbox_provider_skipped provider=_LocalProvider: which runs an agent's image by name: 'solver-image' v2 is "
+            "only a build context") in caplog.text
 
 
 @pytest.mark.asyncio
@@ -129,3 +146,47 @@ async def test_an_existing_container_sandbox_refuses_it_since_it_never_runs_the_
     with pytest.raises(ValueError, match="Can't deploy agent 'solver' on the container sandbox 'sb-container', which runs its "
                                          "own image, never the agent's: 'solver-image' v2 is only a build context"):
         await A2AAgent(id="solver", version=1, docker_image_artifact=IMAGE).deploy(sandbox=_ContainerSandbox())
+
+
+PULLED_HERE = DockerImageArtifact(id="solver-image", version=2, description="d",
+                                  image_name="localhost:5000/local/solver:v2")
+HERE = "localhost:5000/local/solver:v2 is in a registry on this machine, which a sandbox elsewhere can't pull from"
+NO_REGISTRY = DockerImageArtifact(id="solver-image", version=2, description="d", image_name="solver:v2")
+
+
+@pytest.mark.asyncio
+async def test_an_existing_container_sandbox_elsewhere_takes_an_agent_whose_image_is_in_this_machines_registry(
+        local_stores, litellm):
+    """It pulls nothing, so where the agent's image is doesn't matter: the deploy goes on to the container's card."""
+    with pytest.raises(RuntimeError, match="No tunnel URL for port"):
+        await A2AAgent(id="solver", version=1, docker_image_artifact=PULLED_HERE).deploy(sandbox=_ContainerSandbox())
+
+
+class _LocalPulls(LocalSandboxProvider):
+    async def create_sandbox(self, **_):
+        raise _Created
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider, image, refusal", [
+    (_VmProvider(), PULLED_HERE, f"with _VmProvider, whose VMs can't run it: {HERE}"),
+    (_ModalProvider(), PULLED_HERE, f"with _ModalProvider, which runs an agent's image by name: {HERE}"),
+    (_VmProvider(), NO_REGISTRY, "with _VmProvider, whose VMs can't run it: 'solver-image' v2 has no tar.gz, and its "
+                                 "image name 'solver:v2' doesn't name a registry to pull it from"),
+], ids=["vm-elsewhere", "modal", "vm-nothing-to-pull"])
+async def test_an_image_a_provider_cant_get_is_refused_before_anything_is_created(monkeypatch, local_stores, litellm,
+                                                                                 provider, image, refusal):
+    monkeypatch.setattr(sandbox_provider, "build_sandbox_provider", lambda name: provider)
+
+    with pytest.raises(ValueError, match=f"Can't deploy agent 'solver' {refusal}"):
+        await A2AAgent(id="solver", version=1, docker_image_artifact=image).deploy(sandbox_type="any")
+    assert getattr(provider, "steps", []) == []
+
+
+@pytest.mark.asyncio
+async def test_the_local_provider_is_asked_for_a_sandbox_for_an_image_in_its_own_registry(monkeypatch, local_stores,
+                                                                                         litellm):
+    monkeypatch.setattr(sandbox_provider, "build_sandbox_provider", lambda name: _LocalPulls())
+
+    with pytest.raises(_Created):
+        await A2AAgent(id="solver", version=1, docker_image_artifact=PULLED_HERE).deploy(sandbox_type="any")

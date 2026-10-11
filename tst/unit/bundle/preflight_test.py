@@ -1,6 +1,7 @@
-"""Where a bundle run's tasks deploy, checked before anything is written: images only this machine has on another
-provider, VMs asked of a provider that can't create one, containers on the local provider without Docker, the default
-agent, and the infra envs a gateway deploy on the local provider needs."""
+"""Where a bundle run's tasks deploy, checked before anything is written: images a provider can't run as it runs them
+(one a sandbox elsewhere would pull from this machine's registry among them), VMs asked of a provider that can't create
+one, containers on the local provider without Docker, the default agent, and the infra envs a gateway deploy on the
+local provider needs."""
 
 import asyncio
 import json
@@ -39,6 +40,9 @@ from tst.unit.bundle._support import layout, local_store
 
 LOCAL = ("localhost:5000/local/img:v1", "file:///state/img-v1.tar.gz")
 REMOTE = ("123456789012.dkr.ecr.us-west-2.amazonaws.com/img:v1", "s3://bucket/img-v1.tar.gz")
+PULLED_HERE = ("localhost:5000/local/img:v1", None)  # no tar.gz, so a sandbox pulls it from this machine's registry
+ARM64_HERE = (*LOCAL, "linux/arm64")  # built here on Apple silicon, as the infra bootstrap builds it
+HERE = "localhost:5000/local/img:v1 is in a registry on this machine, which a sandbox elsewhere can't pull from"
 
 
 @pytest.fixture
@@ -61,9 +65,10 @@ def _task(root, steps, name="t"):
 
 
 def _image(id, where=LOCAL):
+    """An image named ``where[0]``, its tar.gz at ``where[1]``, recording ``where[2]``'s platform when given."""
     with namespace_routing():
         return get_artifact_store().put_document(DockerImageArtifact(
-            id=id, description=id, image_name=where[0], tar_gz_s3_url=where[1]))
+            id=id, description=id, image_name=where[0], tar_gz_s3_url=where[1], platform=(where[2:] or (None,))[0]))
 
 
 def _agent(id, where=LOCAL):
@@ -102,25 +107,63 @@ AGENT = {"id": "agent", "type": "deploy_agent", "env_ids": [], "a2a_agent_id": "
 # Images only this machine has
 
 
-@pytest.mark.parametrize("sandbox", ["modal", "local,modal"])
-def test_an_image_only_this_machine_has_is_refused_on_another_provider_before_anything_is_written(bundle_dir, sandbox):
+def test_an_image_in_this_machines_registry_is_refused_where_a_sandbox_elsewhere_pulls_it_before_anything_is_written(
+        bundle_dir):
     _agent("solver")
     _task(bundle_dir, [AGENT])
 
-    assert _problems(lambda: run_bundle(bundle_dir, sandbox=sandbox)) == [
-        "tasks/t.json: step 'agent': deploys agent 'solver''s image on the 'modal' sandbox provider, which can't reach it: "
-        "localhost:5000/local/img:v1 is in a registry on this machine; run it with --sandbox local",
+    assert _problems(lambda: run_bundle(bundle_dir, sandbox="modal")) == [
+        f"tasks/t.json: step 'agent': deploys agent 'solver''s image on the 'modal' sandbox provider: {HERE}; run it "
+        "with --sandbox local, or on a provider whose VMs load its tar.gz, such as --sandbox modal_vm",
     ]
     assert not local_store().path.exists()
 
 
-def test_an_image_saved_only_in_this_machines_object_store_is_refused_too(bundle_dir):
+def test_a_chain_runs_an_image_in_this_machines_registry_on_its_local_provider_skipping_one_elsewhere(bundle_dir):
+    _agent("solver")
+    _task(bundle_dir, [AGENT])
+
+    assert [entry.name for entry in dry_run_bundle(bundle_dir, sandbox="modal,local").runs] == ["t"]
+
+
+@pytest.mark.parametrize("where", [LOCAL, (REMOTE[0], LOCAL[1])])
+def test_a_vm_elsewhere_loads_a_tar_gz_only_this_machine_holds_which_agent_env_pushes_it(bundle_dir, where):
+    """It never pulls the image, so a registry on this machine doesn't matter; the tar.gz goes over the VM's exec."""
+    _agent("solver", where)
+    _task(bundle_dir, [AGENT])
+
+    assert [entry.name for entry in dry_run_bundle(bundle_dir, sandbox="modal_vm").runs] == ["t"]
+
+
+@pytest.mark.parametrize("sandbox, refused", [("modal_vm", True), ("modal", True), ("local", False)])
+def test_an_image_with_no_tar_gz_in_this_machines_registry_runs_only_on_the_local_provider(bundle_dir, sandbox, refused):
+    _agent("solver", PULLED_HERE)
+    _task(bundle_dir, [AGENT])
+
+    if refused:
+        assert _problems(lambda: dry_run_bundle(bundle_dir, sandbox=sandbox)) == [
+            f"tasks/t.json: step 'agent': deploys agent 'solver''s image on the {sandbox!r} sandbox provider: {HERE}; "
+            "run it with --sandbox local"]
+    else:
+        assert [entry.name for entry in dry_run_bundle(bundle_dir, sandbox=sandbox).runs] == ["t"]
+
+
+@pytest.mark.parametrize("sandbox", ["modal", "modal_vm"])
+def test_a_lone_server_runs_its_image_by_name_wherever_it_deploys_so_no_vm_provider_is_offered(bundle_dir, sandbox):
+    """A VM provider's containers pull by name too: only an agent or a gateway loads a tar.gz in a VM."""
+    _env("crm", LOCAL, env_provider_type="server")
+    _task(bundle_dir, [{"id": "env", "type": "deploy_env", "env_id": "crm"}])
+
+    assert _problems(lambda: dry_run_bundle(bundle_dir, sandbox=sandbox)) == [
+        f"tasks/t.json: step 'env': deploys env 'crm''s image 'crm-image' on the {sandbox!r} sandbox provider: {HERE}; "
+        "run it with --sandbox local"]
+
+
+def test_a_remote_image_with_a_tar_gz_only_this_machine_holds_is_pulled_where_a_sandbox_runs_it_by_name(bundle_dir):
     _agent("solver", (REMOTE[0], LOCAL[1]))
     _task(bundle_dir, [AGENT])
 
-    (problem,) = _problems(lambda: dry_run_bundle(bundle_dir, sandbox="modal_vm"))
-    assert problem.endswith("can't reach it: 'solver-image' is saved in this machine's object store; run it with "
-                            "--sandbox local")
+    assert [entry.name for entry in dry_run_bundle(bundle_dir, sandbox="modal").runs] == ["t"]
 
 
 def test_a_remote_image_runs_anywhere_and_a_local_one_on_the_local_provider(bundle_dir):
@@ -223,8 +266,9 @@ def test_a_sandbox_image_in_this_machines_registry_is_refused_on_another_provide
                                                                       "image": "python:3.12"}])
 
     assert _problems(lambda: dry_run_bundle(bundle_dir, sandbox="modal")) == [
-        "tasks/t.json: step 'box': deploys the image localhost:5000/box:v1 on the 'modal' sandbox provider, which can't "
-        "reach it: localhost:5000/box:v1 is in a registry on this machine; run it with --sandbox local",
+        "tasks/t.json: step 'box': deploys the image localhost:5000/box:v1 on the 'modal' sandbox provider: "
+        "localhost:5000/box:v1 is in a registry on this machine, which a sandbox elsewhere can't pull from; run it with "
+        "--sandbox local",
     ]
 
 
@@ -287,17 +331,16 @@ BY_NAME = ("on the {sandbox!r} sandbox provider, which runs it by name: '{id}' v
 
 
 @pytest.mark.parametrize("sandbox, refused", [("modal_vm", False), ("modal", False), ("modal_vm,modal", False),
-                                              ("local", True), ("modal_vm,local", True)])
+                                              ("local", True), ("modal_vm,local", False)])
 def test_an_agent_image_that_is_only_a_build_context_runs_where_a_vm_or_modal_builds_it(bundle_dir, sandbox, refused):
+    """A chain skips the local provider, which runs an image by name, so one that builds it is enough."""
     with namespace_routing():
         A2AAgent.put(id="solver", docker_image_artifact=_context_image("solver-image"))
     _task(bundle_dir, [AGENT])
 
     if refused:
-        link = "local" if "local" in sandbox else sandbox
         assert _problems(lambda: dry_run_bundle(bundle_dir, sandbox=sandbox)) == [
-            "tasks/t.json: step 'agent': deploys agent 'solver''s image "
-            + BY_NAME.format(sandbox=sandbox if link == sandbox else link, id="solver-image")]
+            "tasks/t.json: step 'agent': deploys agent 'solver''s image " + BY_NAME.format(sandbox=sandbox, id="solver-image")]
     else:
         assert [entry.name for entry in dry_run_bundle(bundle_dir, sandbox=sandbox).runs] == ["t"]
 
@@ -343,6 +386,86 @@ def test_modal_builds_a_gateway_image_that_is_only_a_build_context_but_not_a_ser
         "built, not pulled; run it on a provider whose VMs build it, such as --sandbox modal_vm"]
 
 
+# Images built for another platform than the sandboxes run, which a VM refuses as it loads them
+
+
+def test_the_dry_run_leaves_an_images_platform_to_the_vm_that_loads_it(bundle_dir):
+    """No provider says beforehand what its sandboxes run; a sandbox carries its platform once it exists."""
+    _agent("solver", ARM64_HERE)
+    _task(bundle_dir, [AGENT])
+
+    assert [entry.name for entry in dry_run_bundle(bundle_dir, sandbox="modal_vm").runs] == ["t"]
+
+
+def test_a_vm_provider_isnt_offered_for_an_image_its_vms_wouldnt_run(bundle_dir):
+    """Modal can't pull from this machine's registry; a VM would load the tar.gz, but it's for linux/arm64."""
+    _agent("solver", ARM64_HERE)
+    _task(bundle_dir, [AGENT])
+
+    assert _problems(lambda: dry_run_bundle(bundle_dir, sandbox="modal")) == [
+        f"tasks/t.json: step 'agent': deploys agent 'solver''s image on the 'modal' sandbox provider: {HERE}; run it with "
+        "--sandbox local"]
+
+
+# Agents placed on a sandbox the task deploys
+
+BOX = {"id": "box", "type": "deploy_sandbox", "sandbox_name": "box", "sandbox_mode": "vm", "exposed_ports": [8000]}
+PLACED = {**AGENT, "sandbox_name": "box"}
+
+
+@pytest.mark.parametrize("sandbox", ["local", "modal_vm"])
+def test_an_agent_placed_on_a_vm_sandbox_runs_any_image_that_vm_loads(bundle_dir, sandbox):
+    """The VM loads the agent's image, so one that is only a build context runs there, on the local provider too, whose
+    agents run by image name only on sandboxes of their own."""
+    with namespace_routing():
+        A2AAgent.put(id="solver", docker_image_artifact=_context_image("solver-image"))
+    _task(bundle_dir, [BOX, PLACED])
+
+    assert [entry.name for entry in dry_run_bundle(bundle_dir, sandbox=sandbox).runs] == ["t"]
+
+
+def test_an_agent_placed_on_a_vm_sandbox_elsewhere_is_refused_an_image_that_vm_cant_pull(bundle_dir):
+    _agent("solver", PULLED_HERE)
+    _task(bundle_dir, [BOX, PLACED])
+
+    assert _problems(lambda: dry_run_bundle(bundle_dir, sandbox="modal_vm")) == [
+        f"tasks/t.json: step 'agent': deploys agent 'solver''s image on the 'modal_vm' sandbox provider: {HERE}; run it "
+        "with --sandbox local"]
+
+
+@pytest.mark.parametrize("box, problem", [
+    ({**BOX, "sandbox_mode": "container", "image": "python:3.12", "port": 8000},
+     "Cannot link agent to sandbox 'box' (mode='container'); only VM-mode sandboxes can host an additional agent "
+     "container"),
+    ({**BOX, "exposed_ports": [9000]},
+     "Sandbox 'box' does not expose port 8000; re-deploy DeploySandboxTaskStep with exposed_ports=[8000]"),
+], ids=["container", "no-a2a-port"])
+def test_an_agent_is_refused_a_sandbox_deploy_agent_cant_place_it_on_in_the_steps_own_words(bundle_dir, box, problem):
+    _agent("solver", REMOTE)
+    _task(bundle_dir, [box, PLACED])
+
+    assert _problems(lambda: dry_run_bundle(bundle_dir, sandbox="modal_vm")) == [f"tasks/t.json: step 'agent': {problem}"]
+
+
+# Preflight refuses with the words the deploy itself would
+
+
+@pytest.mark.parametrize("where, sandbox", [(PULLED_HERE, "modal_vm"), (PULLED_HERE, "modal"), (LOCAL, "modal"),
+                                            (NO_REGISTRY, "modal_vm")])
+def test_preflight_refuses_an_agent_for_the_reason_its_deploy_would(bundle_dir, monkeypatch, where, sandbox):
+    """Both make the one check (``Accepts.problem``), so a deploy preflight passes isn't refused for its image."""
+    agent = _agent("solver", where)
+    _task(bundle_dir, [AGENT])
+    (problem,) = _problems(lambda: dry_run_bundle(bundle_dir, sandbox=sandbox))
+    monkeypatch.setenv("LITELLM_API_KEY", "k")
+    monkeypatch.setenv("LITELLM_BASE_URL", "http://litellm.example/v1")
+
+    with pytest.raises(ValueError) as refused:
+        asyncio.run(agent.deploy(sandbox_type=sandbox))
+
+    assert str(refused.value).split(": ", 1)[1] in problem
+
+
 # What a provider can create
 
 
@@ -383,6 +506,18 @@ def test_containers_on_the_local_provider_need_docker_and_a_vm_sandbox_doesnt(bu
     assert _problems(lambda: dry_run_bundle(bundle_dir, tasks=["agent", "hello"])) == [
         "the local sandbox provider runs containers for tasks/agent.json: step 'agent', and docker isn't on PATH",
     ]
+
+
+def test_a_chain_that_skips_the_local_provider_doesnt_need_docker(bundle_dir, monkeypatch):
+    """The local provider runs an image by name, so a deploy of one that is only a build context skips it for a VM."""
+    probes = []
+    monkeypatch.setattr(preflight_module, "docker_unreachable", lambda: probes.append(1) or "docker isn't on PATH")
+    with namespace_routing():
+        A2AAgent.put(id="solver", docker_image_artifact=_context_image("solver-image"))
+    _task(bundle_dir, [AGENT])
+
+    assert [entry.name for entry in dry_run_bundle(bundle_dir, sandbox="modal_vm,local").runs] == ["t"]
+    assert probes == []
 
 
 class _DeploysItself(Env):
@@ -556,12 +691,13 @@ def test_a_gateway_deploy_on_another_provider_needs_infra_it_can_reach(bundle_di
     (problem, *_) = _problems(lambda: dry_run_bundle(bundle_dir, sandbox="modal_vm"))
     assert problem.startswith("tasks/t.json: step 'env': deploys on the 'modal_vm' sandbox provider, which needs the "
                               "gateway env 'default', and the store doesn't hold it")
-    _infra()
+    _infra(PULLED_HERE)
     problems = _problems(lambda: dry_run_bundle(bundle_dir, sandbox="modal_vm"))
     assert problems[0] == ("tasks/t.json: step 'env': deploys the gateway env 'default''s image 'gateway-default' on the "
-                           "'modal_vm' sandbox provider, which can't reach it: localhost:5000/local/img:v1 is in a "
-                           "registry on this machine; run it with --sandbox local")
+                           f"'modal_vm' sandbox provider: {HERE}; run it with --sandbox local")
     assert len(problems) == 4  # the gateway's image, and the service-db's three
+    _infra()  # tar.gzs only this machine holds, which the gateway's VM loads once agent-env pushes them
+    assert [entry.name for entry in dry_run_bundle(bundle_dir, sandbox="modal_vm").runs] == ["t"]
 
 
 def test_infra_on_another_provider_with_no_tarball_and_no_registry_to_pull_it_from_is_refused(bundle_dir):
@@ -579,17 +715,16 @@ def test_infra_on_another_provider_with_no_tarball_and_no_registry_to_pull_it_fr
 
 
 def test_a_problem_several_deploys_share_is_reported_once_naming_the_first(bundle_dir):
-    _env("crm")
+    _env("crm", PULLED_HERE)
     with namespace_routing():
-        GatewayEnv.put(id="default", docker_image_artifact=_image("gateway-default"))
-        db = _image("db")  # one image for all three of the service-db's, so each deploy finds its problem three times
+        GatewayEnv.put(id="default", docker_image_artifact=_image("gateway-default", PULLED_HERE))
+        db = _image("db", PULLED_HERE)  # one for all three of the service-db's, so each deploy finds its problem thrice
         ServiceDBEnv.put(id="default-db", db_docker_image_artifact=db, db_web_docker_image_artifact=db,
                          db_mcp_docker_image_artifact=db)
     for name in ("a", "b", "c"):
         _task(bundle_dir, [{"id": "env", "type": "deploy_env", "env_id": "crm"}], name=name)
 
-    unreachable = ("on the 'modal_vm' sandbox provider, which can't reach it: localhost:5000/local/img:v1 is in a "
-                   "registry on this machine; run it with --sandbox local")
+    unreachable = f"on the 'modal_vm' sandbox provider: {HERE}; run it with --sandbox local"
     assert _problems(lambda: dry_run_bundle(bundle_dir, sandbox="modal_vm")) == [
         f"tasks/a.json: step 'env' (and 2 more deploys): deploys env 'crm''s image 'crm-image' {unreachable}",
         f"tasks/a.json: step 'env' (and 2 more deploys): deploys the gateway env 'default''s image 'gateway-default' "
