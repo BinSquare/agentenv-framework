@@ -9,12 +9,14 @@ from __future__ import annotations
 import asyncio
 import collections
 import contextlib
+import errno
 import functools
 import glob
 import json
 import logging
 import os
 import platform
+import random
 import re
 import shlex
 import shutil
@@ -28,8 +30,14 @@ from typing import TYPE_CHECKING, Any, Optional
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
+try:
+    import fcntl
+except ImportError:  # Windows, which agent-env does not target.
+    fcntl = None
+
 from agent_env import config
 from agent_env.attribution import Attribution
+from agent_env.config.paths import state_root
 from agent_env.providers.sandbox_providers.sandbox import SANDBOX_LABEL, NetworkPolicy, VmSandbox
 from agent_env.providers.sandbox_providers.sandbox_provider import (
     SANDBOX_MODE_CONTAINER,
@@ -39,6 +47,7 @@ from agent_env.providers.sandbox_providers.sandbox_provider import (
 )
 from agent_env.store.object_store.local.tls import local_ca
 from agent_env.store.object_store.local.store import LocalFilesystemObjectStore
+from agent_env.store.local_state import ensure_state_dir
 from agent_env.store.routing import LocalRunObjectStore
 
 if TYPE_CHECKING:
@@ -86,6 +95,13 @@ LOCAL_TRUST_ENV = {
 _CONTAINER_MODE_MARKER = ".agent-container-mode"
 # The sandbox's container port -> host port map, so a sandbox rebuilt from its id publishes and finds the same ports.
 _PORT_MAP_FILE = ".port-map.json"
+# The host ports sandboxes publish on: below the default ranges outgoing connections take their local ports from (32768
+# up on Linux, the VM Docker Desktop or Rancher Desktop runs Docker in included; 49152 up on macOS and Windows) and
+# below Kubernetes' node ports (30000-32767).
+_HOST_PORTS = range(20000, 30000)
+# Holds the last host port handed out, in the per-user state root's locks, so processes sharing that root hand them
+# out in turn.
+_HOST_PORT_CURSOR = "host-ports"
 
 
 def _local_sandbox_root_path() -> Path:
@@ -110,17 +126,41 @@ def _local_sandbox_root() -> Path:
 
 
 def _free_host_port() -> int:
-    """A currently-free host port.
+    """The next port in ``_HOST_PORTS`` after the last one handed out, skipping those in use.
 
-    Binds all interfaces, as docker does when publishing a port: a port free on loopback
-    alone can still be taken on another interface.
-
-    Racy: the port is released before docker binds it. The window is small and a loser
-    fails loudly at bind time.
+    Docker binds it later, so nothing may take it meanwhile: a deploy sharing this state root draws it again only after
+    the whole range has gone round, and outgoing connections don't use the range by default. The probe alone could not
+    keep it: it releases the port, and can't see the sockets of a VM Docker runs in.
     """
+    locks = state_root() / "locks"
+    ensure_state_dir(locks)
+    fd = os.open(locks / _HOST_PORT_CURSOR, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        last = os.read(fd, 16).strip()
+        start = int(last) + 1 if last.isdigit() else random.choice(_HOST_PORTS)
+        for i in range(len(_HOST_PORTS)):
+            port = _HOST_PORTS[(start + i - _HOST_PORTS.start) % len(_HOST_PORTS)]
+            if _bindable(port):
+                os.ftruncate(fd, 0)
+                os.pwrite(fd, str(port).encode(), 0)
+                return port
+    finally:
+        os.close(fd)
+    raise RuntimeError(f"Every host port from {_HOST_PORTS.start} to {_HOST_PORTS.stop - 1} is in use")
+
+
+def _bindable(port: int) -> bool:
+    """Whether ``port`` is free on every interface, as docker binds it when publishing: a port free on loopback alone
+    can still be taken on another interface. A bind that fails for another reason raises."""
     with socket.socket() as s:
-        s.bind(("", 0))
-        return int(s.getsockname()[1])
+        try:
+            s.bind(("", port))
+        except OSError as e:
+            if e.errno == errno.EADDRINUSE:
+                return False
+            raise
+        return True
 
 
 class LocalSandbox(VmSandbox):
@@ -520,10 +560,10 @@ class LocalSandboxProvider(SandboxProvider):
     ) -> LocalSandbox:
         refuse_unenforceable_policy(self, network_policy)
         # Allocated here rather than in the sandbox constructor: probing for a free port
-        # is I/O, and callers that only need a handle must not pay for it.
-        sandbox = LocalSandbox(
-            port_map={port: _free_host_port() for port in (exposed_ports or [])},
-        )
+        # is I/O, and callers that only need a handle must not pay for it. Off the event
+        # loop, since a draw waits for any other process's draw to finish.
+        port_map = await asyncio.to_thread(lambda: {port: _free_host_port() for port in exposed_ports or []})
+        sandbox = LocalSandbox(port_map=port_map)
         (sandbox.work_dir / _PORT_MAP_FILE).write_text(json.dumps(sandbox._port_map))
         sandbox.network_policy = self.effective_network_policy(network_policy)
         return sandbox
