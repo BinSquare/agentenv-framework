@@ -17,7 +17,7 @@ def _provider(on_this_machine: bool):
     sandbox.tunnel_urls, sandbox.vnc_url, sandbox.network_policy = {}, None, NetworkPolicy()
     provider = AsyncMock(ON_THIS_MACHINE=on_this_machine)
     provider.links = (provider,)
-    provider.create_sandbox.return_value = sandbox
+    provider.create_container.return_value = sandbox
     return provider
 
 
@@ -31,13 +31,13 @@ async def test_a_container_sandbox_pulls_an_image_from_this_machines_registry_on
     with patch("agent_env.providers.sandbox_providers.sandbox_provider.get_sandbox_provider", return_value=provider):
         if on_this_machine:
             await step.execute(TaskStepContext())
-            provider.create_sandbox.assert_awaited_once()
+            provider.create_container.assert_awaited_once()
         else:
             with pytest.raises(ValueError, match="Can't deploy sandbox 'box' with AsyncMock, whose sandboxes pull it by "
                                                  "name: localhost:5000/box:v1 is in a registry on this machine, which a "
                                                  "sandbox elsewhere can't pull from"):
                 await step.execute(TaskStepContext())
-            provider.create_sandbox.assert_not_awaited()
+            provider.create_container.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -50,6 +50,25 @@ async def test_a_chain_pulls_an_image_from_this_machines_registry_on_its_provide
                return_value=ChainedSandboxProvider([elsewhere, here])):
         await step.execute(TaskStepContext())
 
-    elsewhere.create_sandbox.assert_not_awaited()
-    here.create_sandbox.assert_awaited_once()
+    elsewhere.create_container.assert_not_awaited()
+    here.create_container.assert_awaited_once()
 
+
+@pytest.mark.asyncio
+async def test_a_container_deploy_falls_back_when_the_first_provider_fails():
+    step = DeploySandboxTaskStep(
+        id="s", version=1, sandbox_name="box", sandbox_mode="container",
+        image="localhost:5000/box:v1", port=80, env_vars={"MODE": "test"},
+    )
+    first, second = _provider(on_this_machine=True), _provider(on_this_machine=True)
+    first.create_container.side_effect = RuntimeError("unavailable")
+    context = TaskStepContext()
+
+    with patch("agent_env.providers.sandbox_providers.sandbox_provider.get_sandbox_provider",
+               return_value=ChainedSandboxProvider([first, second])):
+        await step.execute(context)
+
+    first.create_container.assert_awaited_once()
+    second.create_container.assert_awaited_once()
+    assert second.create_container.await_args.kwargs["env"] == {"MODE": "test"}
+    assert context.deployed_sandboxes[0].sandbox_mode == "container"

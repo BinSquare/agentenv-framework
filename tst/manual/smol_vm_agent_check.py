@@ -70,3 +70,24 @@ async def test_local_run_registry_image_pulls_inside_smol_vm(local_stack):
         assert code == 0, stderr
     finally:
         await sandbox.terminate()
+
+
+@pytest.mark.asyncio
+async def test_container_mode_starts_image_with_environment_inside_smol_vm(local_stack):
+    agent = put_test_agent(f"smol-container-{uuid.uuid4().hex[:8]}")
+    context = TaskStepContext(instance_id=f"smol-container-run-{uuid.uuid4().hex[:8]}")
+    step = DeploySandboxTaskStep(
+        id="box", version=None, sandbox_name="box", sandbox_mode="container", sandbox_type="smol_vm",
+        image=agent.docker_image_artifact.image_name, port=DEFAULT_A2A_PORT,
+        env_vars={**agent.default_env_vars, "A2A_PORT": str(DEFAULT_A2A_PORT)},
+        cpu=2, memory_mb=4096, disk_size_gb=16,
+    )
+
+    try:
+        await step.execute(context)
+        assert context.deployed_sandboxes[0].sandbox_mode == "container"
+        url = context.deployed_sandboxes[0].tunnel_urls[str(DEFAULT_A2A_PORT)]
+        assert (await agent._wait_for_agent_card(url))["name"]
+    finally:
+        report = await teardown_run(context)
+        assert not report.still_up
