@@ -94,7 +94,7 @@ dev = [
     "pytest-xdist>=3.0.0",
 ]
 smol = [
-    "smolmachines>=1.26.1",
+    "smolmachines>=1.27.0",
 ]
 
 [project.scripts]
