@@ -462,6 +462,8 @@ class A2AAgent:
                 )
                 self._owns_sandbox = True
                 logger.info(f"Sandbox created: {self._sandbox.sandbox_id} (mode={self._sandbox.mode})")
+                if problem := provider.sandbox_problem(self._sandbox, image):
+                    raise ValueError(problem)
             else:
                 if network_policy is not None and network_policy.restricts_egress:
                     raise NetworkPolicyUnsupportedError(
