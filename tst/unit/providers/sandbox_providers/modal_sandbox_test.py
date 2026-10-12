@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from agent_env.config import get_config
+from agent_env.providers.sandbox_providers import modal_sandbox
 from agent_env.providers.sandbox_providers.modal_sandbox import ModalSandbox, ModalSandboxProvider
 from agent_env.store import set_object_store
 from tst.unit.store.fakes import ConfiguredObjectStore
@@ -105,6 +106,150 @@ async def test_create_container_terminates_a_sandbox_whose_create_is_cancelled(_
             await _patched_provider.create_container(image_name="registry.example/mcp-server-example:v1", port=18765, env={})
 
     fake_sb.terminate.aio.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_create_container_terminates_a_sandbox_modal_creates_after_its_create_is_cancelled(_patched_provider):
+    """Cancelled while Modal is still creating the sandbox, as a deploy cancelled mid-batch is: Modal creates it all the
+    same, and it would run until its timeout, so the create waits for it and terminates it."""
+    fake_sb = MagicMock()
+    fake_sb.terminate.aio = AsyncMock()
+    asked, release = asyncio.Event(), asyncio.Event()
+
+    async def experimental_create(*args, **kwargs):
+        asked.set()
+        await release.wait()
+        return fake_sb
+
+    with patch("agent_env.providers.sandbox_providers.modal_sandbox.modal.Sandbox._experimental_create") as mock_create:
+        mock_create.aio = AsyncMock(side_effect=experimental_create)
+        create = asyncio.create_task(
+            _patched_provider.create_container(image_name="registry.example/mcp-server-example:v1", port=18765, env={}))
+        await asyncio.wait_for(asked.wait(), timeout=5)
+        create.cancel()
+        release.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await create
+
+    fake_sb.terminate.aio.assert_awaited_once()
+    fake_sb.wait_until_ready.aio.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_sandbox_a_cancelled_create_cant_terminate_is_named_in_a_warning(_patched_provider, caplog):
+    """It runs until its timeout, so whoever reads the log can find it."""
+    fake_sb = MagicMock(object_id="sb-STILLRUNNING")
+    fake_sb.terminate.aio = AsyncMock(side_effect=RuntimeError("Modal is unavailable"))
+    asked, release = asyncio.Event(), asyncio.Event()
+
+    async def experimental_create(*args, **kwargs):
+        asked.set()
+        await release.wait()
+        return fake_sb
+
+    with patch("agent_env.providers.sandbox_providers.modal_sandbox.modal.Sandbox._experimental_create") as mock_create:
+        mock_create.aio = AsyncMock(side_effect=experimental_create)
+        create = asyncio.create_task(
+            _patched_provider.create_container(image_name="registry.example/mcp-server-example:v1", port=18765, env={}))
+        await asyncio.wait_for(asked.wait(), timeout=5)
+        create.cancel()
+        release.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await create
+
+    assert any("sb-STILLRUNNING" in r.getMessage() and "Modal is unavailable" in r.getMessage()
+               for r in caplog.records if r.levelname == "WARNING")
+
+
+async def _cancel_a_create_that_hangs(provider, *, cancels: int) -> tuple[MagicMock, asyncio.Event]:
+    """Start a create whose request to Modal hangs until the returned event is set, cancel it ``cancels`` times, and
+    check it raises CancelledError without the request having ended."""
+    fake_sb = MagicMock(object_id="sb-LATE")
+    fake_sb.terminate.aio = AsyncMock()
+    asked, release = asyncio.Event(), asyncio.Event()
+
+    async def experimental_create(*args, **kwargs):
+        asked.set()
+        await release.wait()
+        return fake_sb
+
+    with patch("agent_env.providers.sandbox_providers.modal_sandbox.modal.Sandbox._experimental_create") as mock_create:
+        mock_create.aio = AsyncMock(side_effect=experimental_create)
+        create = asyncio.create_task(
+            provider.create_container(image_name="registry.example/mcp-server-example:v1", port=18765, env={}))
+        await asyncio.wait_for(asked.wait(), timeout=5)
+        for _ in range(cancels):
+            create.cancel()
+            await asyncio.sleep(0)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(create, timeout=5)
+    fake_sb.terminate.aio.assert_not_called()
+    return fake_sb, release
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancels, wait_seconds", [(1, 0.05), (2, 30)], ids=["outlasts-the-wait", "cancelled-again"])
+async def test_a_cancelled_create_stops_waiting_on_a_request_that_hangs_and_terminates_what_it_creates_later(
+        _patched_provider, monkeypatch, caplog, cancels, wait_seconds):
+    """So a hung request can't hold up a chain's deadline or a Ctrl-C, nor leave a sandbox behind when it ends."""
+    monkeypatch.setattr(modal_sandbox, "_CANCELLED_CREATE_WAIT_SECONDS", wait_seconds)
+
+    fake_sb, release = await _cancel_a_create_that_hangs(_patched_provider, cancels=cancels)
+    release.set()
+    for _ in range(50):
+        if fake_sb.terminate.aio.await_count:
+            break
+        await asyncio.sleep(0.01)
+
+    fake_sb.terminate.aio.assert_awaited_once()
+    assert any("still waiting on Modal" in r.getMessage() for r in caplog.records if r.levelname == "WARNING")
+
+
+@pytest.mark.asyncio
+async def test_a_sandbox_created_just_as_a_cancelled_creates_wait_gives_up_is_terminated(_patched_provider, monkeypatch):
+    """The wait can give up in the same step Modal answers, which leaves the create done but its sandbox running."""
+    fake_sb = MagicMock(object_id="sb-JUSTINTIME")
+    fake_sb.terminate.aio = AsyncMock()
+    asked, release = asyncio.Event(), asyncio.Event()
+
+    async def experimental_create(*args, **kwargs):
+        asked.set()
+        await release.wait()
+        return fake_sb
+
+    async def gives_up_as_the_create_ends(awaitable, timeout):
+        await awaitable
+        raise TimeoutError
+
+    with patch("agent_env.providers.sandbox_providers.modal_sandbox.modal.Sandbox._experimental_create") as mock_create:
+        mock_create.aio = AsyncMock(side_effect=experimental_create)
+        create = asyncio.create_task(
+            _patched_provider.create_container(image_name="registry.example/mcp-server-example:v1", port=18765, env={}))
+        await asked.wait()
+        monkeypatch.setattr(modal_sandbox.asyncio, "wait_for", gives_up_as_the_create_ends)
+        create.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await create
+    for _ in range(50):
+        if fake_sb.terminate.aio.await_count:
+            break
+        await asyncio.sleep(0.01)
+
+    fake_sb.terminate.aio.assert_awaited_once()
+
+
+def test_a_process_that_exits_while_a_cancelled_create_hangs_names_the_create_in_a_warning(
+        _patched_provider, monkeypatch, caplog):
+    """Exiting cancels the create, so what Modal makes for it runs until its timeout; the warning lets it be found."""
+    monkeypatch.setattr(modal_sandbox, "_CANCELLED_CREATE_WAIT_SECONDS", 0.05)
+
+    asyncio.run(_cancel_a_create_that_hangs(_patched_provider, cancels=1))
+
+    assert any("stopped before Modal answered" in r.getMessage() and "mcp-server-example:v1" in r.getMessage()
+               for r in caplog.records if r.levelname == "WARNING")
 
 
 @pytest.mark.asyncio

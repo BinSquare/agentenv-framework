@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import functools
 import hashlib
 import logging
 import os
@@ -53,6 +54,36 @@ _I6PN_RESOLVE_CMD = "getent ahostsv6 i6pn.modal.local 2>/dev/null | awk 'NR==1 {
 # chunks divisible by 3 so concatenated base64 has padding only at EOF (mid-stream
 # '=' would make `base64 -d` truncate the file).
 _STDIN_CHUNK_BYTES = 8 * 1024 * 1024 - ((8 * 1024 * 1024) % 3)
+# How long a cancelled create waits for its request to Modal to end, a few seconds as a rule; past it the cancel goes
+# on, and the sandbox the request creates is terminated when it ends.
+_CANCELLED_CREATE_WAIT_SECONDS = 30
+# Terminations started after their create's cancel had gone on, kept so they run to their end.
+_LATE_TERMINATIONS: set[asyncio.Task] = set()
+
+
+async def _terminate_created(sb: modal.Sandbox) -> None:
+    """Terminate ``sb``, which a cancelled create made. A failure is logged, naming it, since it runs until its
+    timeout."""
+    try:
+        await sb.terminate.aio()
+    except Exception as e:
+        logger.warning(f"Could not terminate Modal sandbox {sb.object_id}, whose create was cancelled; it runs until "
+                       f"its timeout: {fmt_exc(e)}")
+
+
+def _terminate_when_created(creating: asyncio.Future, *, call_context: str) -> None:
+    """Terminate the sandbox a create that outlasted its cancel's wait made, if it made one. A create cancelled before
+    it ended, as a process that exits cancels it, may have made one all the same, which runs until its timeout, so a
+    warning names the call."""
+    if creating.cancelled():
+        logger.warning(f"A cancelled Modal sandbox create was stopped before Modal answered; a sandbox Modal made for "
+                       f"it runs until its timeout: {call_context}")
+        return
+    if creating.exception() is not None:
+        return
+    task = creating.get_loop().create_task(_terminate_created(creating.result()))
+    _LATE_TERMINATIONS.add(task)
+    task.add_done_callback(_LATE_TERMINATIONS.discard)
 
 
 def _tunnel_url(t) -> str:
@@ -348,15 +379,35 @@ class ModalSandboxProvider(SandboxProvider):
                 *(command or []), i6pn=i6pn, image=image, **create_kwargs
             )
 
-        try:
+        async def create_rebuilding_once() -> modal.Sandbox:
             try:
-                sb = await create(image)
+                return await create(image)
             except modal.exception.NotFoundError:
                 if built_id is None:
                     raise
                 # Modal no longer holds the image this process built from the context, so it's built again, once.
-                image, built_id = await self._context_image(prepared, stale=built_id)
-                sb = await create(image)
+                rebuilt, _ = await self._context_image(prepared, stale=built_id)
+                return await create(rebuilt)
+
+        # Modal may create the sandbox even when this create is cancelled, so the request runs on, and what it creates
+        # is terminated: a cancelled create leaves nothing running. The cancel waits for it a while only, so a request
+        # that hangs can't hold up a chain's deadline or a Ctrl-C.
+        creating = asyncio.ensure_future(create_rebuilding_once())
+        try:
+            sb = await asyncio.shield(creating)
+        except asyncio.CancelledError:
+            created = None
+            try:
+                created = await asyncio.wait_for(asyncio.shield(creating), _CANCELLED_CREATE_WAIT_SECONDS)
+            except (Exception, asyncio.CancelledError):  # it failed, outlasted the wait, or a second cancel came
+                # A create that ended just as the wait gave up runs the callback at once
+                creating.add_done_callback(functools.partial(_terminate_when_created, call_context=call_context))
+                if not creating.done():
+                    logger.warning(f"A cancelled Modal sandbox create is still waiting on Modal; the sandbox it "
+                                   f"creates, if any, is terminated when it ends: {call_context}")
+            if created is not None:
+                await _terminate_created(created)
+            raise
         except Exception as e:
             raise RuntimeError(
                 f"Modal sandbox create failed [{fmt_exc(e)}]: {call_context}"
