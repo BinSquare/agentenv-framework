@@ -13,7 +13,37 @@ import pytest
 from agent_env.providers.sandbox_providers.smol_vm import provider as module
 from agent_env.providers.sandbox_providers.smol_vm import sandbox as sandbox_module
 from agent_env.providers.sandbox_providers.smol_vm.sandbox import SmolVmSandbox, _host_url
+from agent_env.store.image_store.local_registry_image_store import LocalRegistryImageStore
 from agent_env.store.object_store.local.store import LocalFilesystemObjectStore
+from agent_env.store.routing import LocalRunImageStore
+
+
+@pytest.mark.asyncio
+async def test_agent_sandbox_returns_vm_to_load_saved_or_context_only_images(monkeypatch):
+    provider = module.SmolVmSandboxProvider()
+    create_vm = AsyncMock(return_value=SimpleNamespace(mode="vm"))
+    monkeypatch.setattr(provider, "create_vm", create_vm)
+
+    sandbox = await provider.create_sandbox(image_name="local-image", port=8080, env={"A2A_PORT": "8080"})
+
+    assert sandbox.mode == "vm"
+    assert create_vm.await_args.kwargs["exposed_ports"] == [8080]
+
+
+@pytest.mark.asyncio
+async def test_local_run_proxies_its_underlying_loopback_registries(monkeypatch):
+    store = LocalRunImageStore(
+        LocalRegistryImageStore("localhost:5001"), LocalRegistryImageStore("localhost:5000"),
+    )
+    monkeypatch.setattr(module, "get_config", lambda: SimpleNamespace(get_image_store=lambda: store))
+    sandbox = SimpleNamespace(exec_script=AsyncMock())
+
+    await module.SmolVmSandboxProvider()._ensure_local_registry_proxy(sandbox)
+
+    commands = [call.args[0] for call in sandbox.exec_script.await_args_list]
+    assert len(commands) == 2
+    assert "TCP-LISTEN:5000" in commands[0]
+    assert "TCP-LISTEN:5001" in commands[1]
 
 
 @pytest.mark.asyncio
@@ -142,4 +172,17 @@ async def test_unreachable_local_grant_falls_back_to_object_push(monkeypatch, tm
     sandbox._write_unsigned_object = AsyncMock()
 
     await sandbox._download_object_to_vm(object_url, "/storage/image.tar.gz")
+    sandbox._write_unsigned_object.assert_awaited_once_with(store, object_url, "/storage/image.tar.gz")
+
+
+@pytest.mark.asyncio
+async def test_loopback_advertised_grant_uses_object_push(monkeypatch, tmp_path):
+    store = LocalFilesystemObjectStore(str(tmp_path), grant_advertise_host="localhost")
+    object_url = store.put("image.tar.gz", b"archive")
+    monkeypatch.setattr(sandbox_module, "get_config", lambda: SimpleNamespace(get_object_store_at=lambda url: store))
+    sandbox = SmolVmSandbox(MagicMock(id="agentenv-test"), {})
+    sandbox._write_unsigned_object = AsyncMock()
+
+    await sandbox._download_object_to_vm(object_url, "/storage/image.tar.gz")
+
     sandbox._write_unsigned_object.assert_awaited_once_with(store, object_url, "/storage/image.tar.gz")

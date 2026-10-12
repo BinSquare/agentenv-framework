@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shlex
+from typing import ClassVar
 from urllib.parse import urlsplit, urlunsplit
 
 from smol import ConnectOptions, Machine
@@ -29,6 +30,7 @@ def _host_url(url: str) -> str:
 
 
 class SmolVmSandbox(VmSandbox):
+    _READ_GRANT_LIFETIME_SECONDS: ClassVar[int] = 3600
     type = "smol_vm"
     ON_THIS_MACHINE = True
 
@@ -61,7 +63,9 @@ class SmolVmSandbox(VmSandbox):
         signed = await asyncio.to_thread(store.signed_get_url, object_url)
         local_grant = isinstance(store, LocalFilesystemObjectStore) and store.supports_transfer_grants and store.grants_reach(self.type)
         if signed is None and local_grant:
-            signed = (await asyncio.to_thread(store.issue_read_grant, object_url, expires_in=3600)).url
+            signed = (await asyncio.to_thread(
+                store.issue_read_grant, object_url, expires_in=self._READ_GRANT_LIFETIME_SECONDS,
+            )).url
         if signed is None:
             await self._write_unsigned_object(store, object_url, vm_path)
             return

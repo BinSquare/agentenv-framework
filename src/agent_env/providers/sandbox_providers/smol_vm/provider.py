@@ -16,6 +16,7 @@ from smol import ConnectOptions, Machine, MachineConfig, PortSpec, ResourceSpec
 from agent_env.attribution import Attribution
 from agent_env.config import get_config
 from agent_env.store.image_store.local_registry_image_store import LocalRegistryImageStore
+from agent_env.store.routing import LocalRunImageStore
 from agent_env.providers.sandbox_providers.sandbox import NetworkPolicy
 from agent_env.providers.sandbox_providers.local_sandbox import LOCAL_TRUST_ENV, local_grant_trust, start_trusting
 from agent_env.providers.sandbox_providers.sandbox_provider import (
@@ -33,6 +34,8 @@ def _host_port() -> int:
 
 
 class SmolVmSandboxProvider(SandboxProvider):
+    _DOCKER_READY_ATTEMPTS: ClassVar[int] = 40
+    _LOCAL_REGISTRY_DEFAULT_PORT: ClassVar[int] = 5000
     ON_THIS_MACHINE: ClassVar[bool] = True
     CREATES_VMS: ClassVar[bool] = True
     SANDBOX_ACCEPTS: ClassVar[Accepts] = Accepts.LOADABLE
@@ -53,10 +56,9 @@ class SmolVmSandboxProvider(SandboxProvider):
                              cpu: float = 1.0, memory: int = 8192, disk_size_gb: float = 10,
                              timeout: int = 7200, attribution: Attribution | None = None,
                              network_policy: NetworkPolicy | None = None) -> SmolVmSandbox:
-        return await self.create_container(
-            image_name=image_name, port=port, env=env, cpu=cpu, memory=memory,
-            disk_size_gb=disk_size_gb, timeout=timeout, attribution=attribution,
-            network_policy=network_policy,
+        return await self.create_vm(
+            exposed_ports=[port], cpu=cpu, memory=memory, disk_size_gb=disk_size_gb,
+            timeout=timeout, attribution=attribution, network_policy=network_policy,
         )
 
     async def create_vm(self, *, image: str | None = None, boot_mode: str | None = None,
@@ -110,7 +112,7 @@ class SmolVmSandboxProvider(SandboxProvider):
         )
         if code:
             raise RuntimeError(f"Could not install guest Docker dependencies ({code}): {stdout[-500:]} {stderr[-500:]}")
-        await sandbox.exec_script("""
+        await sandbox.exec_script(f"""
 set -e
 mkdir -p /storage/docker /storage/containerd /var/lib/docker /var/lib/containerd
 mountpoint -q /var/lib/docker || mount --bind /storage/docker /var/lib/docker
@@ -118,7 +120,7 @@ mountpoint -q /var/lib/containerd || mount --bind /storage/containerd /var/lib/c
 if ! docker info >/dev/null 2>&1; then
     rm -f /var/run/docker.pid /run/containerd/containerd.pid
     dockerd --storage-driver=overlay2 >/tmp/agentenv-dockerd.log 2>&1 &
-    for i in $(seq 1 40); do docker info >/dev/null 2>&1 && exit 0; sleep 1; done
+    for i in $(seq 1 {self._DOCKER_READY_ATTEMPTS}); do docker info >/dev/null 2>&1 && exit 0; sleep 1; done
     tail -80 /tmp/agentenv-dockerd.log
     exit 1
 fi
@@ -127,14 +129,16 @@ fi
 
     async def _ensure_local_registry_proxy(self, sandbox: SmolVmSandbox) -> None:
         store = get_config().get_image_store()
-        if not isinstance(store, LocalRegistryImageStore):
-            return
-        registry = urlsplit(f"//{store.registry_host}")
-        if registry.hostname not in ("localhost", "127.0.0.1"):
-            return
-        port = registry.port or 5000
-        pid_file = f"/run/agentenv-registry-proxy-{port}.pid"
-        await sandbox.exec_script(f"""
+        stores = (store.configured, store.local) if isinstance(store, LocalRunImageStore) else (store,)
+        ports = set()
+        for candidate in stores:
+            if isinstance(candidate, LocalRegistryImageStore):
+                registry = urlsplit(f"//{candidate.registry_host}")
+                if registry.hostname in ("localhost", "127.0.0.1"):
+                    ports.add(registry.port or self._LOCAL_REGISTRY_DEFAULT_PORT)
+        for port in sorted(ports):
+            pid_file = f"/run/agentenv-registry-proxy-{port}.pid"
+            await sandbox.exec_script(f"""
 if ! test -f {pid_file} || ! kill -0 "$(cat {pid_file})" 2>/dev/null; then
     socat TCP-LISTEN:{port},bind=127.0.0.1,reuseaddr,fork TCP:host.smolvm.internal:{port} \
         >/tmp/agentenv-registry-proxy-{port}.log 2>&1 &

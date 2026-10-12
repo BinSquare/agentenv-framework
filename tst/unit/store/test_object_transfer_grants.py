@@ -83,6 +83,14 @@ def test_custom_private_advertised_host_is_not_claimed_reachable_from_smol_vm(tm
     assert not store.grants_reach("smol_vm")
 
 
+@pytest.mark.parametrize("host", ["localhost", "127.0.0.1"])
+def test_loopback_grant_url_is_not_claimed_reachable_from_agent_container(tmp_path, host) -> None:
+    store = LocalFilesystemObjectStore(str(tmp_path), grant_advertise_host=host)
+
+    assert store.grants_reach("local")
+    assert not store.grants_reach("smol_vm")
+
+
 def test_local_store_grants_can_be_turned_off(tmp_path) -> None:
     assert not LocalFilesystemObjectStore(str(tmp_path), grants="off").supports_transfer_grants
     with pytest.raises(ValueError, match="grants must be one of"):
