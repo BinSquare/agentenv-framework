@@ -171,8 +171,16 @@ class SandboxProvider(ABC):
     # sandbox the images that follow from what it implements (SANDBOX_ACCEPTS).
     #
     # Whether its sandboxes run on this machine: an image only this machine holds (in a registry or object store on
-    # it) reaches them, its containers need this machine's Docker, and a gateway's infra envs are built here for it.
+    # it) reaches them, they reach this machine's loopback as ``host.docker.internal`` (resolved by Docker, or by the
+    # provider's ``extra_hosts``), they trust the local transfer CA, and a gateway's infra envs are built here for
+    # them. They are containers on this machine's Docker, or VMs here (``REACHES_HOST_AT``).
     ON_THIS_MACHINE: ClassVar[bool] = False
+    # For a provider on this machine, the address its sandboxes' requests to this machine's names arrive at: None for
+    # containers on this machine's Docker, which arrive at the address ``host.docker.internal`` maps to, where the
+    # local grant server listens by default; for a VM here whose networking forwards this machine's names to an
+    # address of its own, that address: ``127.0.0.1``, which the server serves as well by default, or another the
+    # server is bound to. From such a VM, this machine's addresses by number aren't reached.
+    REACHES_HOST_AT: ClassVar[str | None] = None
     # The sandbox modes it creates, derived for each provider class from what it implements (``__init_subclass__``):
     # SANDBOX_MODE_CONTAINER when it implements create_sandbox, SANDBOX_MODE_VM when it implements create_vm.
     SUPPORTED_SANDBOX_MODES: ClassVar[frozenset[str]] = frozenset()
@@ -436,6 +444,19 @@ def reachable_url(url: str, *, from_sandbox_type: Optional[str], to_sandbox_type
     if provider_cls.shares_network_with(to_sandbox_type):
         return url
     return provider_cls.get_external_url(url)
+
+
+def on_this_machine_provider(sandbox_type: Optional[str]) -> Optional[type[SandboxProvider]]:
+    """The provider class registered for ``sandbox_type`` when its sandboxes run on this machine (``ON_THIS_MACHINE``),
+    else None: for no type, an unknown one, or one whose provider can't be loaded here, which reaches nothing of
+    this machine's."""
+    if not sandbox_type:
+        return None
+    try:
+        cls = _sandbox_provider_class(sandbox_type)
+    except (ValueError, ConfigError):
+        return None
+    return cls if cls.ON_THIS_MACHINE else None
 
 
 def registered_sandbox_provider_classes() -> list[type[SandboxProvider]]:
