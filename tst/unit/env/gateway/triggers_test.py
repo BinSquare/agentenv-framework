@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 
+import httpx
 import pytest
 from mcp.types import CallToolResult, TextContent
 
@@ -72,6 +73,22 @@ def engine(monkeypatch):
     return eng
 
 
+@pytest.fixture
+def executor_calls(monkeypatch):
+    """Every executor call as (executor, instruction, context_id); the stub answers with `.reply`, raising it if an
+    exception."""
+    calls = _ExecutorCalls()
+
+    async def fake_executor(self, executor, instruction, context_id):
+        calls.append((executor, instruction, context_id))
+        if isinstance(calls.reply, BaseException):
+            raise calls.reply
+        return calls.reply
+
+    monkeypatch.setattr(TriggerEngine, "_call_executor", fake_executor)
+    return calls
+
+
 def _registration(**overrides):
     base = {
         "watch_roles": ["default"],
@@ -128,6 +145,35 @@ def _registration(**overrides):
     ({"executor": {"a2a_url": "http://e", "role": "executor"},
       "triggers": [{"id": "x", "when": {"type": "action", "tool": "t"},
                     "actions": [{"type": "nl", "instruction": "hi", "as": "x"}]}]}, "only valid on tool actions"),
+    ({"executors": ["bob"], "triggers": []}, "executors must be an object"),
+    ({"executors": {"": {"a2a_url": "http://b", "role": "bob"}}, "triggers": []}, "executors must be an object"),
+    ({"executors": {"bob": {"a2a_url": "http://b"}}, "triggers": []}, "executors['bob'].role must be"),
+    ({"executors": {"bob": {"role": "bob"}}, "triggers": []}, "executors['bob'].a2a_url must be"),
+    ({"watch_roles": ["default", "bob"], "executors": {"bob": {"a2a_url": "http://b", "role": "bob"}},
+      "triggers": []}, "must not be in watch_roles"),
+    ({"executors": {"bob": {"a2a_url": "http://b", "role": "bob"}},
+      "triggers": [{"id": "x", "when": {"type": "action", "tool": "t"},
+                    "actions": [{"type": "nl", "instruction": "hi", "executor": "carol"}]}]},
+     "executor 'carol' is not a registered executor name"),
+    ({"executor": {"a2a_url": "http://e", "role": "executor"},
+      "triggers": [{"id": "x", "when": {"type": "action", "tool": "t"},
+                    "actions": [{"type": "nl", "instruction": "hi", "executor": "executor"}]}]},
+     "is not a registered executor name"),
+    ({"executors": {"bob": {"a2a_url": "http://b", "role": "bob"}},
+      "triggers": [{"id": "x", "when": {"type": "action", "tool": "t"},
+                    "actions": [{"type": "tool", "tool": "t2", "executor": "bob"}]}]}, "only valid on nl actions"),
+    *[({"triggers": [{"id": "x", "when": {"type": "action", "tool": "t", "roles": roles}, "actions": []}]},
+       "when.roles must be a non-empty list") for roles in ("denise", [], [""], [5])],
+    ({"triggers": [{"id": "x", "when": {"type": "time", "after": "y", "offset": "PT1S", "roles": ["denise"]},
+                    "actions": []}]}, "only valid on action and state triggers"),
+    ({"executors": {"denise": {"a2a_url": "http://d", "role": "denise@example.com"}},
+      "triggers": [{"id": "x", "when": {"type": "action", "tool": "t", "roles": ["denise@example.com"]},
+                    "actions": [{"type": "nl", "instruction": "hi", "executor": "denise"}]}]},
+     "would provoke it again"),
+    ({"executor": {"a2a_url": "http://e", "role": "executor"},
+      "triggers": [{"id": "x", "when": {"type": "state", "roles": ["executor"], "check": {
+          "tool": "t", "predicate": {"exists": True}}}, "actions": [{"type": "nl", "instruction": "hi"}]}]},
+     "would provoke it again"),
 ])
 def test_registration_fails_loud(engine, bad, fragment):
     with pytest.raises(TriggerError, match=".*"):
@@ -201,7 +247,7 @@ def test_clear_full_reset(engine):
     engine.clear()
     st = engine.state()
     assert st["triggers"] == [] and st["events"] == []
-    assert st["config"] == {"watch_roles": [], "executor_configured": False}
+    assert st["config"] == {"watch_roles": [], "executor_configured": False, "executors": []}
     # after clear, config is settable fresh (different watch_roles allowed)
     engine.register({"watch_roles": ["solver"], "triggers": []})
     assert engine.state()["config"]["watch_roles"] == ["solver"]
@@ -223,6 +269,124 @@ def test_executor_set_once_and_unset_to_set(engine):
     assert engine.state()["config"]["executor_configured"] is True
     with pytest.raises(TriggerError, match="executor conflicts"):
         engine.register({"executor": {"a2a_url": "http://other", "role": "executor"}, "triggers": []})
+
+
+def test_named_executors_are_additive_and_set_once_per_name(engine):
+    alice = {"a2a_url": "http://alice/", "role": "alice@example.com"}
+    engine.register({"executors": {"alice": alice}, "triggers": []})
+    engine.register({"executors": {"bob": {"a2a_url": "http://bob", "role": "bob@example.com"}}, "triggers": []})
+    engine.register({"executors": {"alice": {**alice, "timeout_seconds": 120}}, "triggers": []})  # identical re-add
+    assert engine.state()["config"]["executors"] == ["alice", "bob"]
+    assert engine.state()["config"]["executor_configured"] is False
+    with pytest.raises(TriggerError, match="executor 'alice' conflicts"):
+        engine.register({"executors": {"alice": {**alice, "a2a_url": "http://elsewhere"}}, "triggers": []})
+    engine.clear()
+    assert engine.state()["config"]["executors"] == []
+
+
+def test_a_named_executor_registered_earlier_serves_a_later_batch(engine):
+    engine.register({"executors": {"bob": {"a2a_url": "http://bob", "role": "bob"}}, "triggers": []})
+    added = engine.register({"triggers": [{"id": "x", "when": {"type": "action", "tool": "t"},
+                                           "actions": [{"type": "nl", "instruction": "hi", "executor": "bob"}]}]})
+    assert added["added"] == ["x"]
+
+
+@pytest.mark.asyncio
+async def test_each_nl_action_goes_to_the_executor_it_names(engine, executor_calls):
+    engine.register({
+        "executor": {"a2a_url": "http://default", "role": "executor"},
+        "executors": {"alice": {"a2a_url": "http://alice", "role": "alice@example.com"},
+                      "bob": {"a2a_url": "http://bob", "role": "bob@example.com"}},
+        "triggers": [{"id": tid, "when": {"type": "action", "tool": "linear_create_issue"},
+                      "actions": [{"type": "nl", "instruction": f"as {tid}", **named}]}
+                     for tid, named in (("d", {}), ("a", {"executor": "alice"}), ("b", {"executor": "bob"}))],
+    })
+    engine.on_tool_call("default", "linear_create_issue", {}, _result())
+    await asyncio.sleep(0.2)
+
+    assert sorted((e["a2a_url"], i, c) for e, i, c in executor_calls) == [
+        ("http://alice", "as a", "trigger-a"), ("http://bob", "as b", "trigger-b"), ("http://default", "as d", "trigger-d")]
+    details = {e["trigger_id"]: e["detail"] for e in engine._events if e["kind"] == "action_ok"}
+    assert details == {"d": {"nl": "as d"}, "a": {"nl": "as a", "executor": "alice"},
+                       "b": {"nl": "as b", "executor": "bob"}}
+
+
+@pytest.mark.asyncio
+async def test_a_named_executor_that_does_not_complete_is_named_in_the_failure(engine, executor_calls):
+    executor_calls.reply = None
+    engine.register({"executors": {"bob": {"a2a_url": "http://bob", "role": "bob"}},
+                     "triggers": [{"id": "x", "when": {"type": "action", "tool": "t"},
+                                   "actions": [{"type": "nl", "instruction": "hi", "executor": "bob"}]}]})
+    engine.on_tool_call("default", "t", {}, _result())
+    await asyncio.sleep(0.2)
+
+    [failure] = [e for e in engine._events if e["kind"] == "action_failed"]
+    assert failure["executor"] == "bob" and engine._triggers["x"]["status"] == "armed"
+
+
+@pytest.mark.asyncio
+async def test_a_named_executor_that_cannot_be_reached_is_named_in_the_failure(engine, executor_calls):
+    executor_calls.reply = httpx.ConnectTimeout("")
+    engine.register({"executors": {"bob": {"a2a_url": "http://bob", "role": "bob"}},
+                     "triggers": [{"id": "x", "when": {"type": "action", "tool": "t"},
+                                   "actions": [{"type": "nl", "instruction": "hi", "executor": "bob"}]}]})
+    engine.on_tool_call("default", "t", {}, _result())
+    await asyncio.sleep(0.2)
+
+    [failure] = [e for e in engine._events if e["kind"] == "action_failed"]
+    assert (failure["executor"], failure["detail"]) == ("bob", "ConnectTimeout")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["executor", "alice@example.com", "bob@example.com"])
+async def test_no_executor_role_is_ever_watched(engine, role):
+    engine.register({"executor": {"a2a_url": "http://e", "role": "executor"},
+                     "executors": {"alice": {"a2a_url": "http://a", "role": "alice@example.com"},
+                                   "bob": {"a2a_url": "http://b", "role": "bob@example.com"}},
+                     "triggers": [{"id": "x", "when": {"type": "action", "tool": "search_emails"}, "actions": []}]})
+    engine._watch_roles.add(role)  # force the dangerous state past validation
+    engine.on_tool_call(role, "search_emails", {}, _result())
+    await asyncio.sleep(0.1)
+    assert engine._triggers["x"]["status"] == "armed"
+
+
+@pytest.mark.asyncio
+async def test_a_trigger_listing_an_executor_role_is_provoked_by_that_executor_alone(engine, executor_calls):
+    engine.register({
+        "executors": {"denise": {"a2a_url": "http://d", "role": "denise@example.com"},
+                      "bob": {"a2a_url": "http://b", "role": "bob@example.com"}},
+        "triggers": [
+            {"id": "denise-hears-solver", "when": {"type": "action", "tool": "slack_send_message", "repeat": True},
+             "actions": [{"type": "nl", "executor": "denise", "instruction": "reply to the solver"}]},
+            {"id": "bob-hears-denise", "when": {"type": "action", "tool": "slack_send_message", "repeat": True,
+                                                "roles": ["denise@example.com"]},
+             "actions": [{"type": "nl", "executor": "bob", "instruction": "reply to denise"}]},
+        ],
+    })
+    for role in ("denise@example.com", "bob@example.com", "default"):
+        engine.on_tool_call(role, "slack_send_message", {}, _result())
+        await asyncio.sleep(0.2)
+
+    assert [(e["role"], i) for e, i, _ in executor_calls] == [
+        ("bob@example.com", "reply to denise"), ("denise@example.com", "reply to the solver")]
+    detected = [(e["trigger_id"], e["provoking"]["role"]) for e in engine._events if e["kind"] == "detected"]
+    assert detected == [("bob-hears-denise", "denise@example.com"), ("denise-hears-solver", "default")]
+    assert {t["id"]: t["when"].get("roles") for t in engine.state()["triggers"]} == {
+        "denise-hears-solver": None, "bob-hears-denise": ["denise@example.com"]}
+
+
+@pytest.mark.asyncio
+async def test_an_executor_write_prompts_only_the_state_triggers_that_list_it(engine):
+    engine._test_state["doc_text"] = "Budget Fit"
+    check = {"tool": "gdocs_get_document_text", "args": {"documentId": "doc-1"},
+             "extract": "text", "predicate": {"regex": "Budget Fit"}}
+    engine.register({"executors": {"denise": {"a2a_url": "http://d", "role": "denise@example.com"}},
+                     "triggers": [{"id": "listed", "when": {"type": "state", "roles": ["denise@example.com"],
+                                                            "check": check}, "actions": []},
+                                  {"id": "unlisted", "when": {"type": "state", "check": check}, "actions": []}]})
+    engine.on_tool_call("denise@example.com", "gdocs_batch_update", {"documentId": "doc-1"}, _result())
+    await asyncio.sleep(0.2)
+    assert {tid: t["status"] for tid, t in engine._triggers.items()} == {"listed": "fired", "unlisted": "armed"}
 
 
 def test_generated_id_on_omit(engine):
@@ -324,7 +488,7 @@ async def test_sensor_trigger_and_state_shape(engine):
     assert engine._triggers["sensor"]["status"] == "fired"
     state = engine.state()
     assert "sensor" in {t["id"] for t in state["triggers"]}
-    assert state["config"] == {"watch_roles": ["default"], "executor_configured": False}
+    assert state["config"] == {"watch_roles": ["default"], "executor_configured": False, "executors": []}
     assert state["events"][0]["kind"] == "added"
     assert all("seq" in e and "ts" in e for e in state["events"])
 
@@ -448,3 +612,7 @@ async def test_step_path_respects_watch_roles(monkeypatch):
     assert resp.status_code == 200
     await asyncio.sleep(0.1)
     assert gw._trigger_engine._triggers["s"]["status"] == "armed"
+
+
+class _ExecutorCalls(list):
+    reply: object = "done"

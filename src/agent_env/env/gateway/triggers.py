@@ -34,7 +34,7 @@ _MAX_CATCHUP = 1000
 _EVENTS_HEAD = 1000
 _EVENTS_TAIL = 9000
 # Schedule keys state() echoes; excludes the unbounded `check`/`where`.
-_WHEN_SUMMARY_KEYS = ("type", "tool", "repeat", "at", "after", "offset", "every", "count", "until", "seed")
+_WHEN_SUMMARY_KEYS = ("type", "tool", "roles", "repeat", "at", "after", "offset", "every", "count", "until", "seed")
 # Placeholder roots reading the provoking call; a bare name is a check-pipeline binding.
 _CTX_PREFIXES = ("args", "result")
 # Where a barrier waits; a further wait point is a new value here, not a new top-level field.
@@ -384,8 +384,7 @@ def _validate_check(check: Any, where: str) -> dict:
 class TriggerEngine:
     def __init__(self, gateway):
         self._gw = gateway
-        self._executor: dict | None = None
-        self._executor_role: str | None = None
+        self._executors: dict[str | None, dict] = {}  # `executor` under None, `executors` by name
         self._watch_roles: set[str] = set()
         self._config_set = False
         self._triggers: dict[str, dict] = {}
@@ -400,11 +399,12 @@ class TriggerEngine:
         self._time_trigger_gate = asyncio.Event()  # parks the driver while no time-trigger is armed
 
     def register(self, body: Any) -> dict:
-        """Additively add each trigger by id (idempotent upsert; conflicting id or bad shape -> 400); watch_roles/executor are set once."""
+        """Additively add each trigger by id (idempotent upsert; conflicting id or bad shape -> 400); watch_roles and
+        executor are set once, and each named executor once per name."""
         if not isinstance(body, dict):
             raise TriggerError("body must be a JSON object")
         watch_roles = self._resolve_watch_roles(body)
-        executor = self._resolve_executor(body, watch_roles)
+        executors = self._resolve_executors(body, watch_roles)
         triggers = body.get("triggers")
         if not isinstance(triggers, list):
             raise TriggerError("triggers must be a list")
@@ -424,7 +424,7 @@ class TriggerEngine:
             if tid in batch_order:
                 raise TriggerError(f"trigger '{tid}': duplicate id")
             batch_order.append(tid)
-            spec = self._normalize_trigger(spec, executor)
+            spec = self._normalize_trigger(spec, executors)
             if known is not None:
                 self._check_tools_known(spec, known)
             existing = self._triggers.get(tid)
@@ -435,8 +435,7 @@ class TriggerEngine:
             to_add.append((tid, spec))
         self._readonly_tools = None
         self._watch_roles = watch_roles
-        self._executor = executor
-        self._executor_role = executor["role"] if executor else None
+        self._executors = executors
         self._config_set = True
         for tid, spec in to_add:
             self._triggers[tid] = {"spec": spec, "status": "armed", "detected_at": None,
@@ -503,8 +502,7 @@ class TriggerEngine:
         self._events_tail.clear()
         self._seq = 0
         self._watch_roles = set()
-        self._executor = None
-        self._executor_role = None
+        self._executors = {}
         self._config_set = False
         self._readonly_tools = None
         self._recompute_time_flag()
@@ -567,23 +565,37 @@ class TriggerEngine:
             raise TriggerError(f"watch_roles {sorted(new)} conflicts with the already-registered {sorted(self._watch_roles)} — clear to change it")
         return new
 
-    def _resolve_executor(self, body: dict, watch_roles: set[str]) -> dict | None:
-        raw = body.get("executor")
-        if raw is None:
-            return self._executor
+    def _resolve_executors(self, body: dict, watch_roles: set[str]) -> dict[str | None, dict]:
+        """The executors once this register lands: those before, plus the body's `executor` (under None) and
+        `executors`, each set once."""
+        named = body.get("executors")
+        if named is not None and (not isinstance(named, dict) or not all(isinstance(n, str) and n for n in named)):
+            raise TriggerError("executors must be an object keyed by non-empty executor names")
+        incoming = ({None: body["executor"]} if body.get("executor") is not None else {}) | (named or {})
+        merged = dict(self._executors)
+        for name, raw in incoming.items():
+            normalized = self._normalize_executor(raw, "executor" if name is None else f"executors[{name!r}]",
+                                                  watch_roles)
+            if merged.get(name, normalized) != normalized:
+                raise TriggerError("executor conflicts with the already-registered executor — clear to change it"
+                                   if name is None else
+                                   f"executor {name!r} conflicts with the already-registered executor of that name — "
+                                   "clear to change it")
+            merged[name] = normalized
+        return merged
+
+    @staticmethod
+    def _normalize_executor(raw: Any, where: str, watch_roles: set[str]) -> dict:
         if not isinstance(raw, dict) or not isinstance(raw.get("a2a_url"), str) or not raw["a2a_url"]:
-            raise TriggerError("executor.a2a_url must be a non-empty string")
+            raise TriggerError(f"{where}.a2a_url must be a non-empty string")
         role = raw.get("role")
         if not isinstance(role, str) or not role:
-            raise TriggerError("executor.role must be a non-empty string (the deployed executor's AgentEnv-Role, kept out of watch_roles so its own tool calls never fire triggers)")
+            raise TriggerError(f"{where}.role must be a non-empty string (the deployed executor's AgentEnv-Role, kept out of watch_roles so its own tool calls never fire triggers)")
         if role in watch_roles:
-            raise TriggerError(f"executor.role {role!r} must not be in watch_roles {sorted(watch_roles)} — the executor's own tool calls would fire triggers (cascade)")
-        normalized = {"a2a_url": raw["a2a_url"].rstrip("/"),
-                      "timeout_seconds": float(raw.get("timeout_seconds", 120)),
-                      "role": role}
-        if self._executor is not None and self._executor != normalized:
-            raise TriggerError("executor conflicts with the already-registered executor — clear to change it")
-        return normalized
+            raise TriggerError(f"{where}.role {role!r} must not be in watch_roles {sorted(watch_roles)} — the executor's own tool calls would fire triggers (cascade)")
+        return {"a2a_url": raw["a2a_url"].rstrip("/"),
+                "timeout_seconds": float(raw.get("timeout_seconds", 120)),
+                "role": role}
 
     @staticmethod
     def _normalize_barrier(spec: dict, tid: str, has_ctx: bool) -> None:
@@ -610,12 +622,13 @@ class TriggerEngine:
                                     or not math.isfinite(timeout) or timeout <= 0):
             raise TriggerError(f"{w}.timeout_seconds must be a positive, finite number (got {timeout!r})")
 
-    def _normalize_trigger(self, spec: dict, executor: dict | None) -> dict:
+    def _normalize_trigger(self, spec: dict, executors: dict[str | None, dict]) -> dict:
         """Validate + normalize a trigger spec in place (fail-loud); returns it, so pass a copy."""
         tid = spec["id"]
         when = spec.get("when")
         if not isinstance(when, dict) or when.get("type") not in ("action", "state", "time"):
             raise TriggerError(f"trigger '{tid}': when.type must be 'action', 'state', or 'time'")
+        self._normalize_roles(when, tid)
         if when["type"] == "action":
             self._normalize_action_when(when, tid)
         elif when["type"] == "state":
@@ -634,8 +647,23 @@ class TriggerEngine:
         if not isinstance(actions, list):
             raise TriggerError(f"trigger '{tid}': actions must be a list")
         for i, action in enumerate(actions):
-            self._normalize_action(action, f"trigger '{tid}': actions[{i}]", has_ctx, executor)
+            self._normalize_action(action, f"trigger '{tid}': actions[{i}]", has_ctx, executors)
+            target = executors.get(action.get("executor"))
+            if action["type"] == "nl" and target is not None and target["role"] in when.get("roles", ()):
+                raise TriggerError(f"trigger '{tid}': when.roles includes {target['role']!r}, the role of the executor "
+                                   f"actions[{i}] goes to, so each of its replies would provoke it again")
         return spec
+
+    @staticmethod
+    def _normalize_roles(when: dict, tid: str) -> None:
+        if when.get("roles") is None:
+            when.pop("roles", None)
+            return
+        if when["type"] == "time":
+            raise TriggerError(f"trigger '{tid}': when.roles is only valid on action and state triggers")
+        roles = when["roles"]
+        if not isinstance(roles, list) or not roles or not all(isinstance(r, str) and r for r in roles):
+            raise TriggerError(f"trigger '{tid}': when.roles must be a non-empty list of non-empty AgentEnv-Roles")
 
     @staticmethod
     def _normalize_action_when(when: dict, tid: str) -> None:
@@ -654,13 +682,15 @@ class TriggerEngine:
             raise TriggerError(f"trigger '{tid}': when.repeat must be a boolean")
 
     @staticmethod
-    def _normalize_action(action: Any, w: str, has_ctx: bool, executor: dict | None) -> None:
-        """Validate one fire-action in place, plus its optional `verify` check and `as` role."""
+    def _normalize_action(action: Any, w: str, has_ctx: bool, executors: dict[str | None, dict]) -> None:
+        """Validate one fire-action in place, plus its optional `verify` check, `as` role and nl `executor` name."""
         atype = action.get("type") if isinstance(action, dict) else None
         if atype not in _ACTION_TYPES:
             raise TriggerError(f"{w}: type must be one of {_ACTION_TYPES}")
         if "as" in action and atype != "tool":
             raise TriggerError(f"{w}: 'as' is only valid on tool actions")
+        if "executor" in action and atype != "nl":
+            raise TriggerError(f"{w}: 'executor' is only valid on nl actions")
         if atype == "nl":
             if not isinstance(action.get("instruction"), str) or not action["instruction"]:
                 raise TriggerError(f"{w}: instruction must be a non-empty string")
@@ -669,8 +699,13 @@ class TriggerEngine:
                 if _is_ctx_attempt(token):
                     raise TriggerError(f"{w}: instruction contains {token!r}, but nl instructions are "
                                        f"not templated; read the provoking call from a tool action's args")
-            if executor is None:
-                raise TriggerError(f"{w}: nl actions require an executor")
+            named = action.get("executor")
+            if named is None:
+                if None not in executors:
+                    raise TriggerError(f"{w}: nl actions require an executor")
+            elif not isinstance(named, str) or named not in executors:
+                raise TriggerError(f"{w}: executor {named!r} is not a registered executor name "
+                                   f"(registered: {sorted(n for n in executors if n is not None)})")
         elif atype == "tool":
             if not isinstance(action.get("tool"), str) or not action["tool"]:
                 raise TriggerError(f"{w}: tool must be a non-empty string")
@@ -749,7 +784,8 @@ class TriggerEngine:
             assert t["status"] in TRIGGER_STATUSES, f"unknown trigger status {t['status']!r}"
         return {
             "config": {"watch_roles": sorted(self._watch_roles),
-                       "executor_configured": self._executor is not None},
+                       "executor_configured": None in self._executors,
+                       "executors": sorted(n for n in self._executors if n is not None)},
             "triggers": [
                 {"id": tid, "type": t["spec"]["when"]["type"],
                  "when": {k: t["spec"]["when"][k] for k in _WHEN_SUMMARY_KEYS if k in t["spec"]["when"]},
@@ -775,9 +811,8 @@ class TriggerEngine:
         """
         pending: list[asyncio.Task] = []
         timeout_s: float | None = None
-        if role == self._executor_role:  # executor's own traffic is never watched (prevents cascades)
-            return pending, timeout_s
-        if role not in self._watch_roles or not self._triggers:
+        provokable = [(tid, trig) for tid, trig in self._triggers.items() if self._provoked_by(trig, role)]
+        if not provokable:
             return pending, timeout_s
         # Before the isError guard: an errored call is still a clock tick.
         if self._has_time_triggers:
@@ -788,7 +823,7 @@ class TriggerEngine:
         data = _result_data(result)
         ctx = {"args": arguments, "result": data}
         provoking = {"tool": name, "role": role}
-        for tid, trig in self._triggers.items():
+        for tid, trig in provokable:
             when = trig["spec"]["when"]
             if when["type"] != "action" or when["tool"] != name:
                 continue
@@ -804,11 +839,23 @@ class TriggerEngine:
                 asked = barrier.get("timeout_seconds") or self._gw.TRIGGER_BARRIER_TIMEOUT_S
                 timeout_s = asked if timeout_s is None else max(timeout_s, asked)
         if not self._is_readonly(name):
-            for tid, trig in self._triggers.items():
+            for tid, trig in provokable:
                 if trig["status"] == "armed" and trig["spec"]["when"]["type"] == "state" and not trig["evaluating"]:
                     trig["evaluating"] = True
                     self._schedule(self._eval_state(tid, trig, provoking))
         return pending, timeout_s
+
+    def _provoked_by(self, trig: dict, role: str) -> bool:
+        """Whether a call by ``role`` can provoke ``trig``: the roles its `when` lists, else the watched ones. Unlisted,
+        an executor's own calls never provoke anything, so an executor cannot set off a cascade unasked."""
+        roles = trig["spec"]["when"].get("roles")
+        if roles is not None:
+            return role in roles
+        return role in self._watch_roles and role not in self._executor_roles
+
+    @property
+    def _executor_roles(self) -> set[str]:
+        return {e["role"] for e in self._executors.values()}
 
     def _mark_detected(self, tid: str, trig: dict, provoking: dict, ctx: dict | None = None) -> asyncio.Task | None:
         ctx = ctx if ctx is not None else {}
@@ -1150,7 +1197,7 @@ class TriggerEngine:
             else:
                 if not await self._run_nl(tid, index, action, ctx):
                     return False
-                detail = {"nl": action["instruction"][:120]}
+                detail = {"nl": action["instruction"][:120], **_named_executor(action)}
             if "verify" in action and action["type"] != "nl":
                 # only an action's own verify inherits its `as`; when.check state probes read as the pin
                 if not await self._run_verify(tid, index, action["verify"], ctx, role=action.get("as")):
@@ -1159,7 +1206,9 @@ class TriggerEngine:
                        changelog_id_before=changelog_before, changelog_id_after=self._gw._query_changelog_id())
             return True
         except Exception as e:
-            self._emit("action_failed", tid, action_index=index, detail=str(e)[:300])
+            # A connect timeout stringifies to nothing, which would leave the log no account of the failure.
+            self._emit("action_failed", tid, action_index=index, detail=(str(e) or type(e).__name__)[:300],
+                       **_named_executor(action))
             return False
 
     async def _run_verify(self, tid: str, index: int, verify: dict, ctx: dict | None = None,
@@ -1172,10 +1221,13 @@ class TriggerEngine:
 
     async def _run_nl(self, tid: str, index: int, action: dict, ctx: dict | None = None) -> bool:
         instruction = action["instruction"]
+        named = _named_executor(action)
+        executor = self._executors.get(action.get("executor"))
         for attempt in (1, 2):
-            reply = await self._call_executor(instruction, context_id=f"trigger-{tid}")
+            reply = await self._call_executor(executor, instruction, context_id=f"trigger-{tid}")
             if reply is None:
-                self._emit("action_failed", tid, action_index=index, detail=f"executor attempt {attempt} did not complete")
+                self._emit("action_failed", tid, action_index=index,
+                           detail=f"executor attempt {attempt} did not complete", **named)
                 return False
             if "verify" not in action:
                 return True
@@ -1184,11 +1236,10 @@ class TriggerEngine:
             if attempt == 1:
                 instruction = (f"{action['instruction']}\n\nYour previous attempt did not pass verification — "
                                f"the expected change is not observable in the environment. Do it again exactly as described.")
-        self._emit("action_failed", tid, action_index=index, detail="verification failed after retry")
+        self._emit("action_failed", tid, action_index=index, detail="verification failed after retry", **named)
         return False
 
-    async def _call_executor(self, instruction: str, context_id: str) -> str | None:
-        executor = self._executor
+    async def _call_executor(self, executor: dict | None, instruction: str, context_id: str) -> str | None:
         if executor is None:
             return None
         url = f"{executor['a2a_url']}/a2a"
@@ -1220,3 +1271,8 @@ class TriggerEngine:
 
 def _result_text(result: CallToolResult) -> str:
     return "\n".join(c.text for c in result.content if getattr(c, "type", None) == "text")
+
+
+def _named_executor(action: dict) -> dict:
+    """``{"executor": name}`` for an nl action that names its executor, for its firing-log events; else empty."""
+    return {"executor": action["executor"]} if action.get("executor") is not None else {}
