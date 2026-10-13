@@ -172,21 +172,36 @@ async def test_a_provider_whose_containers_are_vms_of_their_own_puts_none_on_a_p
 
 
 CONTEXT_ONLY = DockerImageArtifact(id="img", version=2, description="d", image_name="local/img-0123456789ab:v2",
-                                   build_context_object_url="s3://bucket/ctx.tar.gz")
+                                   build_context_object_url="s3://bucket/ctx.tar.gz", dockerfile_path="Dockerfile")
 NO_REGISTRY = DockerImageArtifact(id="img", version=2, description="d", image_name="img:v2")
+# put_context always records the Dockerfile; without it, nothing builds the context.
+CONTEXT_ONLY_NO_DOCKERFILE = CONTEXT_ONLY.model_copy(update={"dockerfile_path": None})
 
 
 IN_THIS_MACHINES_REGISTRY = DockerImageArtifact(id="img", version=2, description="d",
                                                 image_name="localhost:5000/local/img:v2")
 WITH_TAR_GZ = DockerImageArtifact(id="img", version=2, description="d", image_name="localhost:5000/local/img:v2",
                                   tar_gz_object_url="file:///state/img.tar.gz")
-WITH_TAR_GZ_AND_CONTEXT = WITH_TAR_GZ.model_copy(update={"build_context_object_url": "file:///state/ctx.tar.gz"})
+WITH_TAR_GZ_AND_CONTEXT = WITH_TAR_GZ.model_copy(update={"build_context_object_url": "file:///state/ctx.tar.gz",
+                                                         "dockerfile_path": "Dockerfile"})
+# An old context records no Dockerfile, so nothing builds it.
+WITH_TAR_GZ_AND_AN_OLD_CONTEXT = WITH_TAR_GZ.model_copy(update={"build_context_object_url": "file:///state/ctx.tar.gz"})
 HERE = "is in a registry on this machine, which a sandbox elsewhere can't pull from"
+BARE_TAG_TAR_GZ = DockerImageArtifact(id="img", version=2, description="d", image_name="mcp-server-email",
+                                      tar_gz_object_url="s3://bucket/img.tar.gz")
+BARE_TAG_TAR_GZ_AND_CONTEXT = BARE_TAG_TAR_GZ.model_copy(update={"build_context_object_url": "s3://bucket/ctx.tar.gz",
+                                                                 "dockerfile_path": "Dockerfile"})
+BARE_TAG_TAR_GZ_AND_AN_OLD_CONTEXT = BARE_TAG_TAR_GZ.model_copy(
+    update={"build_context_object_url": "s3://bucket/ctx.tar.gz"})
+BUILT_ELSEWHERE = "it's the tag the machine that built it gave it"
 
 
 @pytest.mark.parametrize("image, accepts, problem", [
     (CONTEXT_ONLY, LOADABLE, None), (CONTEXT_ONLY, NAME_OR_CONTEXT, None), (CONTEXT_ONLY, NAME, "only a build context"),
     (NO_REGISTRY, LOADABLE, "doesn't name a registry"), (NO_REGISTRY, NAME, None), (NO_REGISTRY, NAME_OR_CONTEXT, None),
+    (CONTEXT_ONLY_NO_DOCKERFILE, LOADABLE, "records no Dockerfile to build it with"),
+    (CONTEXT_ONLY_NO_DOCKERFILE, NAME_OR_CONTEXT, "only a build context"),
+    (CONTEXT_ONLY_NO_DOCKERFILE, NAME, "only a build context"),
 ])
 @pytest.mark.parametrize("on_this_machine", [True, False])
 def test_an_image_is_refused_by_the_form_its_provider_accepts(image, accepts, problem, on_this_machine):
@@ -200,6 +215,10 @@ def test_an_image_is_refused_by_the_form_its_provider_accepts(image, accepts, pr
     (WITH_TAR_GZ, LOADABLE, None), (WITH_TAR_GZ, NAME, HERE), (WITH_TAR_GZ, NAME_OR_CONTEXT, HERE),
     (WITH_TAR_GZ_AND_CONTEXT, LOADABLE, None), (WITH_TAR_GZ_AND_CONTEXT, NAME, HERE),
     (WITH_TAR_GZ_AND_CONTEXT, NAME_OR_CONTEXT, None),
+    (BARE_TAG_TAR_GZ, LOADABLE, None), (BARE_TAG_TAR_GZ, NAME, BUILT_ELSEWHERE),
+    (BARE_TAG_TAR_GZ, NAME_OR_CONTEXT, BUILT_ELSEWHERE), (BARE_TAG_TAR_GZ_AND_CONTEXT, NAME_OR_CONTEXT, None),
+    (WITH_TAR_GZ_AND_AN_OLD_CONTEXT, NAME_OR_CONTEXT, HERE),
+    (BARE_TAG_TAR_GZ_AND_AN_OLD_CONTEXT, NAME_OR_CONTEXT, BUILT_ELSEWHERE),
 ])
 def test_a_sandbox_elsewhere_cant_pull_from_this_machines_registry_and_one_on_it_can(image, accepts, problem):
     """A VM loads an image's tar.gz, which agent-env pushes to it, and pulls one only when it has none; a provider that
@@ -214,7 +233,8 @@ ARM64_TAR_GZ = DockerImageArtifact(id="img", version=2, description="d", image_n
 ARM64_PULLED = DockerImageArtifact(id="img", version=2, description="d", platform="linux/arm64",
                                    image_name="123456789012.dkr.ecr.us-west-2.amazonaws.com/img:v2")
 ARM64_CONTEXT = DockerImageArtifact(id="img", version=2, description="d", image_name="local/img-0123456789ab:v2",
-                                    build_context_object_url="s3://bucket/ctx.tar.gz", platform="linux/arm64")
+                                    build_context_object_url="s3://bucket/ctx.tar.gz", dockerfile_path="Dockerfile",
+                                    platform="linux/arm64")
 ARM64 = "'img' v2 is a linux/arm64 image, and the sandbox runs linux/amd64; rebuild it for linux/amd64"
 
 

@@ -32,6 +32,8 @@ logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[str, str, int], None]
 
+PUT_AGAIN = "put the image again in an image store whose registry the sandbox can reach"
+
 _SAFE_GIT_NAME = re.compile(r"^[a-zA-Z0-9._-]+$")
 
 
@@ -275,16 +277,33 @@ class DockerImageArtifact(Artifact):
         tag the image's build gives it."""
         return bool(self.build_context_object_url) and not self.tar_gz_object_url and not names_registry(self.image_name)
 
+    @property
+    def buildable(self) -> bool:
+        """Whether the context records its Dockerfile, so a sandbox can build it; old and GitHub contexts don't."""
+        return bool(self.build_context_object_url and self.dockerfile_path)
+
+    @property
+    def stored_under_build_tag(self) -> bool:
+        """Whether the image is a tar.gz under a bare tag, which only the machine that built it has."""
+        return bool(self.tar_gz_object_url) and not names_registry(self.image_name)
+
+    def build_tag_reason(self) -> str:
+        """Why a sandbox elsewhere can't pull an image ``stored_under_build_tag``."""
+        return (f"{self.id!r} v{self.version} is stored as a tar.gz under {self.image_name!r}, which names no registry: "
+                "it's the tag the machine that built it gave it, which a sandbox elsewhere can't pull")
+
     def rebuilt_for(self, platform: str | None) -> bool:
         """Whether a VM sandbox of ``platform`` builds this image from its build context rather than load its tar.gz,
         which is built for another platform: the image runs, though not byte for byte the one stored."""
-        return bool(self.tar_gz_object_url and self.build_context_object_url) and self.platform_problem(platform) is not None
+        return bool(self.tar_gz_object_url) and self.buildable and self.platform_problem(platform) is not None
 
     def load_problem(self, *, on_this_machine: bool, platform: str | None = None) -> str | None:
         """Why a VM sandbox can't get this image, or None when it can: a tar.gz is loaded, an image with none is pulled
         when its name names a registry, one that a VM ``on_this_machine`` or not reaches, and built from its build
         context when it has only that; and a VM of ``platform`` runs only an image built for it, or one it rebuilds
         from the build context beside a tar.gz of another platform."""
+        if self.context_only and not self.buildable:
+            return f"{self.id!r} v{self.version} is only a build context, which records no Dockerfile to build it with"
         if self.tar_gz_object_url or self.context_only:
             return None if self.rebuilt_for(platform) else self.platform_problem(platform)
         if names_registry(self.image_name):
@@ -293,11 +312,12 @@ class DockerImageArtifact(Artifact):
                 "registry to pull it from")
 
     def by_name_problem(self, *, on_this_machine: bool) -> str | None:
-        """Why a sandbox that runs an image by pulling its name can't run this one, or None when it can: a context-only
-        image's name is a tag only its build gives it, a VM sandbox's or Modal's, and pulled, it would be looked up on
-        Docker Hub; and a sandbox not ``on_this_machine`` can't pull from a registry on this machine."""
+        """Why a sandbox that pulls images by name can't run this one, or None: a context-only image must be built,
+        and a sandbox elsewhere can't pull from this machine's registry or an image ``stored_under_build_tag``."""
         if self.context_only:
             return f"{self.id!r} v{self.version} is only a build context, which has to be built, not pulled"
+        if self.stored_under_build_tag and not on_this_machine:
+            return f"{self.build_tag_reason()}; run it on a provider whose VMs load its tar.gz, or {PUT_AGAIN}"
         return pull_problem(self.image_name, on_this_machine=on_this_machine)
 
     def platform_problem(self, platform: str | None) -> str | None:
