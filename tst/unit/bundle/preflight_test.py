@@ -14,6 +14,7 @@ from click.testing import CliRunner
 import agent_env.bundle.preflight as preflight_module
 import agent_env.bundle.run as run_module
 from agent_env.a2a_agent import A2AAgent
+from agent_env.artifact.artifacts import docker_image as docker_image_module
 from agent_env.artifact.artifacts.docker_image import DockerImageArtifact
 from agent_env.artifact.store import get_artifact_store
 from agent_env.bundle import BundleError, dry_run_bundle, run_bundle
@@ -117,6 +118,31 @@ def test_an_image_in_this_machines_registry_is_refused_where_a_sandbox_elsewhere
         "with --sandbox local, or on a provider whose VMs load its tar.gz, such as --sandbox modal_vm",
     ]
     assert not local_store().path.exists()
+
+
+def test_a_registry_image_on_this_machine_a_folder_names_is_refused_where_a_sandbox_elsewhere_pulls_it(bundle_dir):
+    layout(bundle_dir, {"agents/solver/agent.toml": 'image = { ref = "localhost:5000/team/solver:v1" }\n'})
+    _task(bundle_dir, [AGENT])
+
+    [problem] = _problems(lambda: dry_run_bundle(bundle_dir, sandbox="modal"))
+
+    assert problem.startswith("tasks/t.json: step 'agent': deploys agent ")
+    assert "localhost:5000/team/solver:v1 is in a registry on this machine" in problem
+    assert not local_store().path.exists()
+
+
+def test_a_registry_image_a_folder_names_is_checked_and_listed_without_asking_its_registry(bundle_dir, monkeypatch):
+    def no_registry(ref, auth):
+        raise AssertionError("a dry run asked the registry")
+
+    monkeypatch.setattr(docker_image_module, "pin_digest", no_registry)
+    layout(bundle_dir, {"agents/solver/agent.toml": 'image = { ref = "ghcr.io/acme/solver:1" }\n'})
+    _task(bundle_dir, [AGENT])
+
+    dry = dry_run_bundle(bundle_dir, sandbox="modal")
+
+    assert dry.images() == ("agents/solver (ghcr.io/acme/solver:1 image) v1: pulled from its registry, its tag pinned "
+                            "to a digest when it's written",)
 
 
 def test_an_image_stored_under_its_build_tag_is_refused_where_a_sandbox_elsewhere_pulls_it_naming_the_flags(bundle_dir):
@@ -359,6 +385,25 @@ def test_an_agent_image_that_is_only_a_build_context_runs_where_a_vm_or_modal_bu
             "tasks/t.json: step 'agent': deploys agent 'solver''s image " + BY_NAME.format(sandbox=sandbox, id="solver-image")]
     else:
         assert [entry.name for entry in dry_run_bundle(bundle_dir, sandbox=sandbox).runs] == ["t"]
+
+
+@pytest.mark.parametrize("ref, problem", [
+    ("ghcr.io/acme/crm:1", None),
+    ("localhost:5000/team/crm:v1", "localhost:5000/team/crm:v1 is in a registry on this machine"),
+], ids=["public", "this-machine"])
+def test_an_env_folder_naming_a_registry_image_is_checked_as_modals_containers_pull_it(bundle_dir, monkeypatch, ref,
+                                                                                      problem):
+    monkeypatch.setattr(docker_image_module, "pin_digest",
+                        lambda ref, auth: pytest.fail("a dry run asked the registry"))
+    layout(bundle_dir, {"envs/crm/env.toml": f'environment_name = "crm"\nimage = {{ ref = "{ref}" }}\n'})
+    _infra(REMOTE)
+    _task(bundle_dir, [{"id": "env", "type": "deploy_env", "env_id": "crm"}])
+
+    if problem is None:
+        assert [entry.name for entry in dry_run_bundle(bundle_dir, sandbox="modal").runs] == ["t"]
+    else:
+        [found] = _problems(lambda: dry_run_bundle(bundle_dir, sandbox="modal"))
+        assert found.startswith("tasks/t.json: step 'env': deploys env ") and problem in found, found
 
 
 def test_an_env_image_that_is_only_a_build_context_runs_on_a_gateway_vm_and_on_modals_containers(bundle_dir):

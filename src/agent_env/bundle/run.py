@@ -22,8 +22,10 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 
+from agent_env.artifact.artifacts.docker_image import DockerImageArtifact
 from agent_env.env.bootstrap import InfraBuild, ensure_default_envs
 from agent_env.providers import build_sandbox_provider
+from agent_env.store.base import NotFoundError
 from agent_env.store.routing import namespace_routing, run_scope
 from agent_env.task import Task, record_task_cancelled
 from agent_env.task.interrupts import Interrupts
@@ -36,7 +38,7 @@ from .materialize import Materialization, Materialized, materialize
 from .parse import BundleEntry, BundleError, BundleKind, parse_bundle
 from .plan import Plan, Write, plan_bundle
 from .preflight import Preflight, preflight_run
-from .resolve import BuiltImage, Reference, resolve_bundle
+from .resolve import BuiltImage, ImpliedImage, Reference, ReferencedImage, resolve_bundle
 
 logger = logging.getLogger(__name__)
 
@@ -158,13 +160,16 @@ class DryRun:
         return relative(self.materialization.plan.bundle.bundle.root, entry.path)
 
     def images(self) -> tuple[str, ...]:
-        """A line per image the bundle builds: which, the version it would leave, and how it would be written."""
+        """A line per image a folder's image key has the bundle write: which, the version it would leave, and how it
+        would be written."""
         plan, contexts = self.materialization.plan, self.materialization.contexts
         return tuple(
             f"{_label(plan, done.write)} v{done.version}: "
-            + (f"a build context, which each deploy builds where it runs, for {DEFAULT_BUILD_PLATFORM}"
+            + ("pulled from its registry, its tag pinned to a digest when it's written"
+               if isinstance(done.write.source, ReferencedImage)
+               else f"a build context, which each deploy builds where it runs, for {DEFAULT_BUILD_PLATFORM}"
                if done.write.id in contexts else "built on this machine")
-            for done in self.materialization.writes if isinstance(done.write.source, BuiltImage)
+            for done in self.materialization.writes if isinstance(done.write.source, ImpliedImage)
         )
 
 
@@ -436,14 +441,32 @@ def _task_run_command(ref: Reference) -> str:
 def _written(plan: Plan, done: Materialized) -> str:
     what = f"{_label(plan, done.write)}: v{done.version}"
     if done.reused:
-        return f"{what}, unchanged" + (f" ({'; '.join(done.reasons)})" if done.reasons else "")
-    return f"{what} ({'; '.join(done.reasons)})"
+        return f"{what}, unchanged" + (f" ({'; '.join(done.reasons)})" if done.reasons else "") + _pinned(done)
+    return f"{what} ({'; '.join(done.reasons)})" + _pinned(done)
+
+
+# How much of a pinned digest a write line shows, as `docker images` shortens an image id.
+_SHOWN_DIGEST_HEX = 12
+
+
+def _pinned(done: Materialized) -> str:
+    """For an image a tag names in its registry, the digest it was pinned to, which re-runs keep while the ref does."""
+    if not isinstance(done.write.source, ReferencedImage) or "@" in done.write.source.ref:
+        return ""
+    try:
+        name = DockerImageArtifact.get(done.write.id, done.version).image_name
+    except NotFoundError:  # a dry run's image, not yet written
+        return ""
+    algorithm, _, digest = name.rpartition("@")[2].partition(":")
+    return f", pinned to {algorithm}:{digest[:_SHOWN_DIGEST_HEX]}"
 
 
 def _label(plan: Plan, write: Write) -> str:
     """How a write is named: its entry's folder, and for an image built from it, which image."""
     path = _path(plan, write.source.entry)
-    return f"{path} ({write.source.dockerfile} image)" if isinstance(write.source, BuiltImage) else path
+    if isinstance(write.source, BuiltImage):
+        return f"{path} ({write.source.dockerfile} image)"
+    return f"{path} ({write.source.ref} image)" if isinstance(write.source, ReferencedImage) else path
 
 
 def _path(plan: Plan, entry: BundleEntry) -> str:
