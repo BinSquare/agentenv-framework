@@ -244,8 +244,8 @@ def _write_eval(plan: Plan, write: Write) -> int:
 # The writers this release has, by kind; any other kind is refused before anything is written. Tasks are
 # written separately, once every one of them is preflighted, and evals after them, since they name the tasks.
 _WRITERS: dict[BundleKind, Callable[[Plan, Write], int]] = {
-    BundleKind.ARTIFACT: _write_artifact, BundleKind.AGENT: _write_agent, BundleKind.ENV: _write_env,
-    BundleKind.EVAL: _write_eval,
+    BundleKind.ARTIFACT: _write_artifact, BundleKind.SKILL: _write_artifact, BundleKind.AGENT: _write_agent,
+    BundleKind.ENV: _write_env, BundleKind.EVAL: _write_eval,
 }
 
 

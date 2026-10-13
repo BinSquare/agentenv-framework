@@ -22,6 +22,7 @@ from agent_env.artifact import (
     EnvironmentUniverseArtifact,
     FileArtifact,
     FileArtifactUniverse,
+    SkillArtifact,
 )
 from agent_env.artifact.registry import canonical_type, get_artifact_registry
 from agent_env.config import get_config
@@ -67,7 +68,7 @@ _GETTERS = {EntityKind.ENV: Env.get, EntityKind.AGENT: A2AAgent.get, EntityKind.
 
 # The artifact types written from their folders, and what each one's write reads there, which the ledger hashes.
 _FOLDER_WALKS = {FileArtifact: one_file, FileArtifactUniverse: entry_files, EnvironmentArtifact: environment_files,
-                 EnvironmentUniverseArtifact: universe_files}
+                 EnvironmentUniverseArtifact: universe_files, SkillArtifact: entry_files}
 # The env types whose from_toml reads only the toml and what it names, so a type built by one of them is written from
 # its env.toml and the ledger can list what it's made from.
 _ENV_FROM_TOMLS = (Env, MCPServerEnv, WebsiteEnv, MultiEnv)
@@ -345,7 +346,7 @@ class _Planner:
                 except BundleError as e:
                     self.problems.extend(e.problems)
                 continue
-            if source.entry.kind is not BundleKind.ARTIFACT:
+            if source.entry.kind not in (BundleKind.ARTIFACT, BundleKind.SKILL):
                 continue
             cls = registry.get(canonical_type(source.entry.type))
             walk = folder_walk(cls)

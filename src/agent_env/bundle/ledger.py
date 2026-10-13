@@ -125,7 +125,7 @@ class Ledger:
         config = {"dockerfile": write.source.dockerfile} if isinstance(write.source, BuiltImage) else write.source.config
         inputs = {"type": _type(write), "config": _sha256(_canonical(config)),
                   "files": {}, "needs": {}, "store_refs": {}}
-        if write.kind is BundleKind.ARTIFACT:
+        if write.kind in (BundleKind.ARTIFACT, BundleKind.SKILL):
             built = isinstance(write.source, BuiltImage)
             listing = build_context_files if built else folder_walk(get_artifact_registry().get(_type(write)))
             for key, path in listing(self._plan.bundle.bundle, write.source.entry).items():
@@ -207,16 +207,14 @@ def materializing(bundle: Bundle, on_wait: Callable[[], None] | None = None) -> 
 
 
 def _tracked(write: Write) -> bool:
-    """Whether the ledger can list everything ``write`` is made from. Not yet for a skill, nor for a type with
-    a ``from_toml`` of its own, which may read its folder in ways it can't see. An artifact is made from its toml,
+    """Whether the ledger can list everything ``write`` is made from. Not yet for a type with a ``from_toml`` of
+    its own, which may read its folder in ways it can't see. An artifact, a skill included, is made from its toml,
     the files its type reads from its folder (``folder_walk``) and what it references; an agent or env from its
     toml and what it references. A built image is made from its build context, ``build_context_files``; what the
     build fetches (its base image, packages) isn't an input."""
     if isinstance(write.source, BuiltImage):
         return True
-    if write.kind is BundleKind.SKILL:
-        return False
-    if write.kind is BundleKind.ARTIFACT:
+    if write.kind in (BundleKind.ARTIFACT, BundleKind.SKILL):
         return folder_walk(get_artifact_registry().get(_type(write))) is not None
     if write.kind is BundleKind.ENV:
         return env_writer(get_env_registry().get(_type(write)))
