@@ -38,7 +38,7 @@ from .materialize import Materialization, Materialized, materialize
 from .parse import BundleEntry, BundleError, BundleKind, parse_bundle
 from .plan import Plan, Write, plan_bundle
 from .preflight import Preflight, preflight_run
-from .resolve import BuiltImage, ImpliedImage, Reference, ReferencedImage, resolve_bundle
+from .resolve import BuiltImage, BundleImage, Reference, ReferencedImage, resolve_bundle
 
 logger = logging.getLogger(__name__)
 
@@ -160,8 +160,8 @@ class DryRun:
         return relative(self.materialization.plan.bundle.bundle.root, entry.path)
 
     def images(self) -> tuple[str, ...]:
-        """A line per image a folder's image key has the bundle write: which, the version it would leave, and how it
-        would be written."""
+        """A line per image the bundle writes, an image key's or an image folder's: which, the version it would leave,
+        and how it would be written."""
         plan, contexts = self.materialization.plan, self.materialization.contexts
         return tuple(
             f"{_label(plan, done.write)} v{done.version}: "
@@ -169,7 +169,7 @@ class DryRun:
                if isinstance(done.write.source, ReferencedImage)
                else f"a build context, which each deploy builds where it runs, for {DEFAULT_BUILD_PLATFORM}"
                if done.write.id in contexts else "built on this machine")
-            for done in self.materialization.writes if isinstance(done.write.source, ImpliedImage)
+            for done in self.materialization.writes if isinstance(done.write.source, BundleImage)
         )
 
 
