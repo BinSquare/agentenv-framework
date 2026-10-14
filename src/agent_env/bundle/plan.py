@@ -18,6 +18,7 @@ from typing import Any
 from agent_env.a2a_agent import A2AAgent
 from agent_env.artifact import (
     Artifact,
+    CliArtifact,
     EnvironmentArtifact,
     EnvironmentUniverseArtifact,
     FileArtifact,
@@ -46,6 +47,7 @@ from agent_env.store.ids import LOCAL_PREFIX
 from agent_env.store.routing import namespace_routing_enabled
 from agent_env.task import Task
 from agent_env.task_step.registry import get_task_step_registry
+from agent_env.task_step.task_step import TaskStep
 from agent_env.task_step.task_steps.load_artifact import LoadArtifactTaskStep
 
 from ._fs import fold, relative, with_article
@@ -68,7 +70,7 @@ _GETTERS = {EntityKind.ENV: Env.get, EntityKind.AGENT: A2AAgent.get, EntityKind.
 
 # The artifact types written from their folders, and what each one's write reads there, which the ledger hashes.
 _FOLDER_WALKS = {FileArtifact: one_file, FileArtifactUniverse: entry_files, EnvironmentArtifact: environment_files,
-                 EnvironmentUniverseArtifact: universe_files, SkillArtifact: entry_files}
+                 EnvironmentUniverseArtifact: universe_files, SkillArtifact: entry_files, CliArtifact: entry_files}
 # The env types whose from_toml reads only the toml and what it names, so a type built by one of them is written from
 # its env.toml and the ledger can list what it's made from.
 _ENV_FROM_TOMLS = (Env, MCPServerEnv, WebsiteEnv, MultiEnv)
@@ -132,6 +134,7 @@ class _Planner:
         self.outputs = {(output.kind.value, output.id): (entry.entry, output)
                         for entry in resolved.entries for output in entry.outputs}
         self.accepted: dict[_Key, dict] = {}  # each toml a type checks, as it accepted it
+        self.steps: dict[_Key, list[TaskStep]] = {}  # each task's steps that build, as a write will build them
 
     def _add(self, key: _Key, source: ResolvedEntry | BundleImage, needs: list[_Key]) -> None:
         """Record a write in bundle order, a built image just before the entry that builds it."""
@@ -145,6 +148,7 @@ class _Planner:
         store_refs, store_latest = self._check_store_refs(closure)
         self._build_tasks(closure)
         self._check_files(closure)
+        self._check_cli_loads(closure)
         self._check_env_types(closure)
         self._check_multi_names(closure, store_latest)
         self._check_universes(closure, store_latest)
@@ -163,6 +167,7 @@ class _Planner:
         self._check_store_refs(everything, stores=False)
         self._build_tasks(everything)
         self._check_files(everything)
+        self._check_cli_loads(everything)
         self._check_universes(everything, None)
         self._check_loaded_environments(everything, None)
         if self.problems:
@@ -370,6 +375,41 @@ class _Planner:
             except BundleError as e:
                 self.problems.extend(e.problems)
 
+    def _check_cli_loads(self, closure: set[_Key]) -> None:
+        """Each load of one of the bundle's CLIs names what installing it needs, an agent and an env whose gateway it
+        reads, and no two of a task's loads install one command into one agent, where the second would replace the
+        first."""
+        registry = get_artifact_registry()
+        clis = {source.entry.id: source.entry for source in self.nodes.values()
+                if isinstance(source, ResolvedEntry) and source.entry.kind is BundleKind.ARTIFACT
+                and issubclass(registry.get(canonical_type(source.entry.type)) or object, CliArtifact)}
+        for key in sorted(closure, key=self.rank.__getitem__):
+            installed: dict[tuple[str, str], tuple[Any, str]] = {}
+            for step in self.steps.get(key, ()):
+                if not isinstance(step, LoadArtifactTaskStep):
+                    continue
+                loaded = [clis[ref["id"]] for ref in step.artifacts if ref.get("id") in clis]
+                if not loaded:
+                    continue
+                where = f"{self._path(self.nodes[key].entry)}: step {step.id!r}"
+                if missing := [name for name in ("agent_name", "env_id") if not getattr(step, name)]:
+                    names, it = " and ".join(repr(cli.name) for cli in loaded), "them" if len(loaded) > 1 else "it"
+                    self.problems.append(f"{where}: loading the CLI{'s' * (it == 'them')} {names} installs {it} into "
+                                         f"an agent and points {it} at an env's gateway, so the step needs "
+                                         f"{' and '.join(missing)}")
+                    continue
+                for cli in loaded:
+                    command = self.accepted.get(_key(cli), {}).get("command_name")
+                    if command is None:
+                        continue  # its artifact.toml's problem is reported by the file check
+                    if (step.agent_name, command) in installed:
+                        first, name = installed[step.agent_name, command]
+                        self.problems.append(f"{where}: installs the CLI {cli.name!r} as {command!r} in agent "
+                                             f"{step.agent_name!r}, where step {first!r} already installed {name!r} "
+                                             "under that command; give one another command_name")
+                    else:
+                        installed[step.agent_name, command] = (step.id, cli.name)
+
     def _env_accept(self, entry: BundleEntry) -> Any:
         """How ``entry``'s env type checks its env.toml, when it's an env written from one and checks it at all."""
         cls = get_env_registry().get(entry.type) if entry.kind is BundleKind.ENV else None
@@ -571,6 +611,7 @@ class _Planner:
                     failed = True
                     self.problems.append(f"{self._path(source.entry)}: step {step.get('id')!r}: "
                                          f"{registry[step['type']].type} can't read it ({type(e).__name__}: {e})")
+            self.steps[key] = steps
             if not failed:
                 try:
                     Task(id=source.entry.id, version=None, steps=steps)
