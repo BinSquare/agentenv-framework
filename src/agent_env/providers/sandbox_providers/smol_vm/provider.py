@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import logging
 import math
 import shlex
 import socket
@@ -11,7 +12,12 @@ import uuid
 from urllib.parse import urlsplit
 from typing import ClassVar
 
-from smol import ConnectOptions, Machine, MachineConfig, PortSpec, ResourceSpec
+try:
+    from smol import ConnectOptions, Machine, MachineConfig, PortSpec, ResourceSpec
+except ModuleNotFoundError as exc:
+    if exc.name != "smol":
+        raise
+    raise ImportError("SmolVM requires pip install 'agentenv-framework[smol]'") from exc
 
 from agent_env.attribution import Attribution
 from agent_env.config import get_config
@@ -25,6 +31,31 @@ from agent_env.providers.sandbox_providers.sandbox_provider import (
 from agent_env.providers.sandbox_providers.smol_vm.sandbox import SmolVmSandbox
 
 _DUMMY_PORT = 60832
+logger = logging.getLogger(__name__)
+_reapers: set[asyncio.Task] = set()
+
+
+async def _delete_machine(machine: Machine) -> None:
+    try:
+        await asyncio.to_thread(machine.delete)
+    except Exception:
+        logger.exception("Could not delete SmolVM machine %s after failed creation", machine.id)
+
+
+async def _delete_when_created(creation: asyncio.Task) -> None:
+    try:
+        machine = await asyncio.shield(creation)
+    except Exception:  # native creation failed and left no machine to delete
+        return
+    await _delete_machine(machine)
+
+
+def _start_reaper(coroutine) -> asyncio.Task:
+    # Retain the task until cleanup ends, even if a caller is cancelled again.
+    task = asyncio.create_task(coroutine)
+    _reapers.add(task)
+    task.add_done_callback(_reapers.discard)
+    return task
 
 
 def _host_port() -> int:
@@ -85,17 +116,12 @@ class SmolVmSandboxProvider(SandboxProvider):
         try:
             machine = await asyncio.shield(creation)
         except asyncio.CancelledError:
-            # The native create call keeps running after its awaiting task is cancelled.
-            # Wait for it and delete the result so cancellation cannot orphan a VM.
-            try:
-                created = await creation
-            except Exception:
-                pass
-            else:
-                await asyncio.to_thread(created.delete)
+            # Native creation continues after cancellation. The independent reaper also
+            # survives a second cancellation while waiting for the machine to appear.
+            await asyncio.shield(_start_reaper(_delete_when_created(creation)))
             raise
-        sandbox = SmolVmSandbox(machine, ports)
         try:
+            sandbox = SmolVmSandbox(machine, ports)
             await self._setup_docker(sandbox)
             await sandbox.detect_platform()
             await self._configure_host_access(sandbox)
@@ -103,7 +129,7 @@ class SmolVmSandboxProvider(SandboxProvider):
             sandbox.network_policy = self.effective_network_policy(network_policy)
             return sandbox
         except BaseException:
-            await sandbox.terminate()
+            await asyncio.shield(_start_reaper(_delete_machine(machine)))
             raise
 
     async def _setup_docker(self, sandbox: SmolVmSandbox) -> None:

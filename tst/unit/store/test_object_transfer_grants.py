@@ -45,10 +45,14 @@ def test_local_store_grants_reach_only_sandboxes_on_this_machine(tmp_path) -> No
 
     assert store.supports_transfer_grants
     assert store.grants_reach("local")
-    assert store.grants_reach("smol_vm")
     assert not store.grants_reach("modal")
     assert not store.grants_reach(None)
     assert not store.grants_reach("no-such-provider")
+
+
+def test_smol_vm_reaches_local_store_when_its_sdk_is_installed(tmp_path) -> None:
+    pytest.importorskip("smol")
+    assert LocalFilesystemObjectStore(str(tmp_path)).grants_reach("smol_vm")
 
 
 @pytest.mark.parametrize("host", ["localhost", "127.0.0.1", "::1"])

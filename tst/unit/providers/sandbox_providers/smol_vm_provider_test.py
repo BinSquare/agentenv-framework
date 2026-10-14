@@ -11,6 +11,8 @@ from types import SimpleNamespace
 
 import pytest
 
+pytest.importorskip("smol")
+
 from agent_env.providers.sandbox_providers.smol_vm import provider as module
 from agent_env.providers.sandbox_providers.smol_vm import sandbox as sandbox_module
 from agent_env.providers.sandbox_providers.smol_vm.sandbox import SmolVmSandbox
@@ -113,6 +115,69 @@ async def test_cancellation_during_native_creation_reclaims_vm(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await task
     assert deleted == [True]
+
+
+@pytest.mark.asyncio
+async def test_second_cancellation_during_create_still_deletes_machine(monkeypatch):
+    started, release, deleted = threading.Event(), threading.Event(), threading.Event()
+
+    class FakeMachine:
+        def delete(self):
+            deleted.set()
+
+    def create(config, conn):
+        started.set()
+        assert release.wait(timeout=10)
+        return FakeMachine()
+
+    monkeypatch.setattr(module, "Machine", SimpleNamespace(create=create))
+    monkeypatch.setattr(module, "_host_port", lambda: 44000)
+    task = asyncio.create_task(module.SmolVmSandboxProvider().create_vm(memory=1024))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        for _ in range(100):
+            if module._reapers:
+                break
+            await asyncio.sleep(0)
+        assert module._reapers
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        release.set()
+    assert await asyncio.to_thread(deleted.wait, 5)
+
+
+@pytest.mark.asyncio
+async def test_second_cancellation_during_setup_still_deletes_machine(monkeypatch):
+    started, deleted = asyncio.Event(), threading.Event()
+
+    class FakeMachine:
+        id = "agentenv-test"
+
+        def delete(self):
+            deleted.set()
+
+    async def setup(self, sandbox):
+        started.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(module, "Machine", SimpleNamespace(create=lambda config, conn: FakeMachine()))
+    monkeypatch.setattr(module, "_host_port", lambda: 44000)
+    monkeypatch.setattr(module.SmolVmSandboxProvider, "_setup_docker", setup)
+    task = asyncio.create_task(module.SmolVmSandboxProvider().create_vm(memory=1024))
+    await asyncio.wait_for(started.wait(), 5)
+    task.cancel()
+    for _ in range(100):
+        if module._reapers:
+            break
+        await asyncio.sleep(0)
+    assert module._reapers
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert await asyncio.to_thread(deleted.wait, 5)
 
 
 @pytest.mark.asyncio

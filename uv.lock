@@ -88,7 +88,6 @@ dev = [
     { name = "pytest-xdist" },
     { name = "requests" },
     { name = "sail" },
-    { name = "smolmachines" },
     { name = "tenki", extra = ["async"] },
     { name = "tensorlake" },
     { name = "uvicorn" },
@@ -120,7 +119,7 @@ tensorlake = [
 [package.metadata]
 requires-dist = [
     { name = "a2a-sdk", specifier = "==0.3.26" },
-    { name = "agentenv-framework", extras = ["aws", "explorer", "gcp", "sail", "smol", "tensorlake", "tenki"], marker = "extra == 'dev'" },
+    { name = "agentenv-framework", extras = ["aws", "explorer", "gcp", "sail", "tensorlake", "tenki"], marker = "extra == 'dev'" },
     { name = "agentenv-framework-protocol", editable = "packages/agentenv-protocol" },
     { name = "boto3", marker = "extra == 'aws'", specifier = ">=1.35.0" },
     { name = "botocore", marker = "extra == 'aws'", specifier = ">=1.35.0" },
