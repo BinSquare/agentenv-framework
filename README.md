@@ -75,7 +75,9 @@ agent_default = "smol_vm"
 
 Each agent and environment gets its own local SmolVM machine with a Docker daemon,
 so workloads are isolated from the host Docker daemon. This needs a supported
-Apple Silicon macOS or Linux host; on Linux, `/dev/kvm` must be available. AgentEnv can still
+Apple Silicon macOS or Linux host; on Linux, `/dev/kvm` must be available. On Apple Silicon,
+build images for `linux/arm64` (or provide their build contexts so SmolVM can rebuild them);
+this provider does not install amd64 emulation in the guest. AgentEnv can still
 use its default local object and image stores: guest containers can fetch local
 object grants, and the VM forwards pulls from the host's loopback registry.
 Cloud image and object stores continue to work through the same provider.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 import threading
 from unittest.mock import AsyncMock, MagicMock
 from types import SimpleNamespace
@@ -12,7 +13,7 @@ import pytest
 
 from agent_env.providers.sandbox_providers.smol_vm import provider as module
 from agent_env.providers.sandbox_providers.smol_vm import sandbox as sandbox_module
-from agent_env.providers.sandbox_providers.smol_vm.sandbox import SmolVmSandbox, _host_url
+from agent_env.providers.sandbox_providers.smol_vm.sandbox import SmolVmSandbox
 from agent_env.store.image_store.local_registry_image_store import LocalRegistryImageStore
 from agent_env.store.object_store.local.store import LocalFilesystemObjectStore
 from agent_env.store.routing import LocalRunImageStore
@@ -59,12 +60,17 @@ async def test_vm_creation_selects_local_and_can_publish_an_unstarted_applicatio
         def write_file(self, path, data):
             created.append((path, data))
 
+        def exec(self, command):
+            assert command == ["uname", "-m"]
+            return SimpleNamespace(exit_code=0, stdout="aarch64\n", stderr="")
+
         def delete(self):
             created.append(("deleted", None))
 
     def create(config, conn):
         assert conn.target == "local"
         assert config.wait_for_ports is False
+        assert config.ttl_seconds == 900
         assert config.resources.network is True
         assert [(p.host, p.guest) for p in config.ports] == [(44000, 8080)]
         return FakeMachine()
@@ -76,8 +82,9 @@ async def test_vm_creation_selects_local_and_can_publish_an_unstarted_applicatio
     monkeypatch.setattr(module, "_host_port", lambda: 44000)
     monkeypatch.setattr(module.SmolVmSandboxProvider, "_setup_docker", setup)
     monkeypatch.setattr(module.SmolVmSandboxProvider, "_configure_host_access", setup)
-    sandbox = await module.SmolVmSandboxProvider().create_vm(exposed_ports=[8080], memory=1024)
+    sandbox = await module.SmolVmSandboxProvider().create_vm(exposed_ports=[8080], memory=1024, timeout=900)
     assert sandbox.tunnel_urls[8080] == "http://127.0.0.1:44000"
+    assert sandbox.platform == "linux/arm64"
     assert ("/storage/agentenv-ports.json", b'{"8080": 44000}') in created
     await sandbox.terminate()
     assert ("deleted", None) in created
@@ -115,6 +122,10 @@ async def test_reconnect_uses_explicit_agent_only_readiness(monkeypatch):
     class FakeMachine:
         id = "agentenv-test"
 
+        def exec(self, command):
+            assert command == ["uname", "-m"]
+            return SimpleNamespace(exit_code=0, stdout="aarch64\n", stderr="")
+
         def read_file(self, path):
             assert path == "/storage/agentenv-ports.json"
             return json.dumps({"8080": 44000}).encode()
@@ -131,12 +142,48 @@ async def test_reconnect_uses_explicit_agent_only_readiness(monkeypatch):
     monkeypatch.setattr("agent_env.providers.sandbox_providers.smol_vm.sandbox.Machine", SimpleNamespace(connect=connect))
     sandbox = await SmolVmSandbox.reconnect("agentenv-test")
     assert sandbox.tunnel_urls == {8080: "http://127.0.0.1:44000"}
+    assert sandbox.platform == "linux/arm64"
     assert options[0].target == "local" and options[0].wait_for_ports is False
 
 
 def test_local_urls_are_rewritten_for_vm_host():
-    assert _host_url("http://127.0.0.1:5000/v2/") == "http://host.smolvm.internal:5000/v2/"
-    assert _host_url("https://example.org/path") == "https://example.org/path"
+    assert module.SmolVmSandboxProvider.get_external_url("http://127.0.0.1:5000/v2/") == "http://host.docker.internal:5000/v2/"
+    assert module.SmolVmSandboxProvider.get_external_url("https://example.org/path") == "https://example.org/path"
+
+
+@pytest.mark.asyncio
+async def test_vm_and_containers_resolve_grant_host_through_smol_gateway():
+    sandbox = SimpleNamespace(
+        exec_with_output=AsyncMock(return_value=(0, "100.96.0.1 STREAM host.smolvm.internal\n", "")),
+        exec_script=AsyncMock(),
+    )
+
+    await module.SmolVmSandboxProvider()._configure_host_access(sandbox)
+
+    assert sandbox.extra_hosts == ("host.docker.internal:100.96.0.1",)
+    script = sandbox.exec_script.await_args.args[0]
+    assert "host.docker.internal" in script and "100.96.0.1" in script
+    assert "/etc/hosts" in script
+
+
+@pytest.mark.asyncio
+async def test_vm_host_entry_updates_without_dropping_other_guest_names(tmp_path):
+    hosts = tmp_path / "hosts"
+    hosts.write_text("127.0.0.1 localhost host.docker.internal\n::1 ip6-localhost\n")
+    sandbox = SimpleNamespace(
+        exec_with_output=AsyncMock(return_value=(0, "100.96.0.1 STREAM host.smolvm.internal\n", "")),
+        exec_script=AsyncMock(),
+    )
+    provider = module.SmolVmSandboxProvider()
+    for gateway in ("100.96.0.1", "100.96.0.2"):
+        sandbox.exec_with_output.return_value = (0, f"{gateway} STREAM host.smolvm.internal\n", "")
+        await provider._configure_host_access(sandbox)
+        script = sandbox.exec_script.await_args.args[0].replace("/etc/hosts", str(hosts))
+        subprocess.run(["bash", "-c", script], check=True)
+        lines = hosts.read_text().splitlines()
+        assert "127.0.0.1 localhost" in lines
+        assert "::1 ip6-localhost" in lines
+        assert [line for line in lines if "host.docker.internal" in line] == [f"{gateway} host.docker.internal"]
 
 
 @pytest.mark.asyncio
@@ -159,7 +206,7 @@ async def test_local_object_download_uses_a_scoped_https_grant(monkeypatch, tmp_
     sandbox.write_host_file.assert_awaited_once()
     command = sandbox.exec_script.await_args.args[0]
     assert "SSL_CERT_FILE=/etc/agentenv-ca-bundle.pem" in command
-    assert "https://host.smolvm.internal:1234/v1/grants/token" in command
+    assert "https://host.docker.internal:1234/v1/grants/token" in command
     assert "-o /storage/image.tar.gz" in command
 
 

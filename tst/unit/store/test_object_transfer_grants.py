@@ -45,6 +45,7 @@ def test_local_store_grants_reach_only_sandboxes_on_this_machine(tmp_path) -> No
 
     assert store.supports_transfer_grants
     assert store.grants_reach("local")
+    assert store.grants_reach("smol_vm")
     assert not store.grants_reach("modal")
     assert not store.grants_reach(None)
     assert not store.grants_reach("no-such-provider")
@@ -87,7 +88,7 @@ def test_custom_private_advertised_host_is_not_claimed_reachable_from_smol_vm(tm
 def test_loopback_grant_url_is_not_claimed_reachable_from_agent_container(tmp_path, host) -> None:
     store = LocalFilesystemObjectStore(str(tmp_path), grant_advertise_host=host)
 
-    assert store.grants_reach("local")
+    assert not store.grants_reach("local")
     assert not store.grants_reach("smol_vm")
 
 

@@ -111,6 +111,7 @@ async def _tenki() -> Sandbox:
     return await provider.create_vm(exposed_ports=[], setup_for_gateway=False)
 async def _smol_vm() -> Sandbox:
     machine = MagicMock(id="agentenv-test")
+    machine.exec.return_value = SimpleNamespace(exit_code=0, stdout="x86_64\n", stderr="")
     with (
         patch.object(smol_module, "Machine", SimpleNamespace(create=lambda config, conn: machine)),
         patch.object(smol_module, "_host_port", return_value=44112),

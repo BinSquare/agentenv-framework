@@ -18,11 +18,11 @@ from agent_env.config import get_config
 from agent_env.store.image_store.local_registry_image_store import LocalRegistryImageStore
 from agent_env.store.routing import LocalRunImageStore
 from agent_env.providers.sandbox_providers.sandbox import NetworkPolicy
-from agent_env.providers.sandbox_providers.local_sandbox import LOCAL_TRUST_ENV, local_grant_trust, start_trusting
+from agent_env.providers.sandbox_providers.local_sandbox import LOCAL_TRUST_ENV, LocalSandboxProvider, local_grant_trust, start_trusting
 from agent_env.providers.sandbox_providers.sandbox_provider import (
     Accepts, SandboxProvider, refuse_unenforceable_policy,
 )
-from agent_env.providers.sandbox_providers.smol_vm.sandbox import SmolVmSandbox, _host_url
+from agent_env.providers.sandbox_providers.smol_vm.sandbox import SmolVmSandbox
 
 _DUMMY_PORT = 60832
 
@@ -37,6 +37,7 @@ class SmolVmSandboxProvider(SandboxProvider):
     _DOCKER_READY_ATTEMPTS: ClassVar[int] = 40
     _LOCAL_REGISTRY_DEFAULT_PORT: ClassVar[int] = 5000
     ON_THIS_MACHINE: ClassVar[bool] = True
+    REACHES_HOST_AT: ClassVar[str] = "127.0.0.1"
     CREATES_VMS: ClassVar[bool] = True
     SANDBOX_ACCEPTS: ClassVar[Accepts] = Accepts.LOADABLE
     CONTAINER_ACCEPTS: ClassVar[Accepts] = Accepts.NAME
@@ -47,10 +48,10 @@ class SmolVmSandboxProvider(SandboxProvider):
 
     @classmethod
     def get_external_url(cls, url: str) -> str:
-        return _host_url(url)
+        return LocalSandboxProvider.get_external_url(url)
 
     def url_from_sandbox(self, url: str) -> str:
-        return _host_url(url)
+        return LocalSandboxProvider.get_external_url(url)
 
     async def create_sandbox(self, *, image_name: str, port: int, env: dict[str, str],
                              cpu: float = 1.0, memory: int = 8192, disk_size_gb: float = 10,
@@ -76,7 +77,7 @@ class SmolVmSandboxProvider(SandboxProvider):
         # Even a portless VM needs a published mapping to select routed virtio-net for nested Docker.
         published = ports or {_DUMMY_PORT: _host_port()}
         config = MachineConfig(
-            name=name, persistent=True, wait_for_ports=False,
+            name=name, persistent=True, wait_for_ports=False, ttl_seconds=timeout,
             resources=ResourceSpec(cpus=math.ceil(cpu), memory_mb=memory, storage_gb=math.ceil(disk_size_gb), network=True),
             ports=[PortSpec(host=host, guest=guest) for guest, host in published.items()],
         )
@@ -96,6 +97,7 @@ class SmolVmSandboxProvider(SandboxProvider):
         sandbox = SmolVmSandbox(machine, ports)
         try:
             await self._setup_docker(sandbox)
+            await sandbox.detect_platform()
             await self._configure_host_access(sandbox)
             await sandbox.persist_ports()
             sandbox.network_policy = self.effective_network_policy(network_policy)
@@ -160,6 +162,13 @@ kill -0 "$(cat {pid_file})"
         if code or not stdout.strip():
             raise RuntimeError(f"Cannot resolve SmolVM host gateway: {stderr[-500:]}")
         gateway = str(ipaddress.IPv4Address(stdout.split()[0]))
+        # VM-level downloads use the same host name as the containers and local grants.
+        # Keep the entry current across reconnects without changing the host's trust CA.
+        await sandbox.exec_script(
+            "sed -i -e 's/[[:space:]]host\\.docker\\.internal\\([[:space:]]\\|$\\)/\\1/g' "
+            "-e '/^[[:space:]]*[[:xdigit:].:]\\+[[:space:]]*$/d' /etc/hosts && "
+            f"printf '%s\\n' {shlex.quote(gateway + ' host.docker.internal')} >> /etc/hosts"
+        )
         sandbox.extra_hosts = (f"host.docker.internal:{gateway}",)
 
     def _container_args(self, sandbox: SmolVmSandbox, *, image_name: str, port: int, env: dict[str, str]) -> str:

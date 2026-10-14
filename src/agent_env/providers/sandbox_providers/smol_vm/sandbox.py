@@ -6,27 +6,19 @@ import asyncio
 import json
 import shlex
 from typing import ClassVar
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 from smol import ConnectOptions, Machine
 
 from agent_env.config import get_config
 from agent_env.providers.sandbox_providers.sandbox import CURL_RETRY_FLAGS, VmSandbox
+from agent_env.providers.sandbox_providers.local_sandbox import LocalSandboxProvider
 from agent_env.store.object_store.local.store import LocalFilesystemObjectStore
 from agent_env.store.object_store.local.tls import local_ca
+from agent_env.utils.docker_build import normalize_platform
 from agent_env.providers.sandbox_providers.sandbox_provider import SANDBOX_MODE_VM
 
 _PORTS_FILE = "/storage/agentenv-ports.json"
-_HOST_ALIAS = "host.smolvm.internal"
-
-
-def _host_url(url: str) -> str:
-    parts = urlsplit(url)
-    if parts.hostname not in ("localhost", "127.0.0.1", "::1", "0.0.0.0", "::", "host.docker.internal"):
-        return url
-    userinfo, at, _ = parts.netloc.rpartition("@")
-    port = f":{parts.port}" if parts.port is not None else ""
-    return urlunsplit(parts._replace(netloc=f"{userinfo}{at}{_HOST_ALIAS}{port}"))
 
 
 class SmolVmSandbox(VmSandbox):
@@ -45,7 +37,13 @@ class SmolVmSandbox(VmSandbox):
         self.extra_hosts = ()
 
     def url_from_sandbox(self, url: str) -> str:
-        return _host_url(url)
+        return LocalSandboxProvider.get_external_url(url)
+
+    async def detect_platform(self) -> None:
+        code, stdout, stderr = await self.exec_with_output("uname", "-m")
+        if code or not stdout.strip():
+            raise RuntimeError(f"Cannot determine SmolVM guest architecture: {stderr[-500:]}")
+        self.platform = normalize_platform(f"linux/{stdout.strip()}")
 
     async def terminate(self) -> None:
         await asyncio.to_thread(self._machine.delete)
@@ -69,8 +67,8 @@ class SmolVmSandbox(VmSandbox):
         if signed is None:
             await self._write_unsigned_object(store, object_url, vm_path)
             return
-        rewritten = _host_url(signed)
-        local_https = local_grant or (rewritten != signed and urlsplit(signed).scheme == "https")
+        rewritten = LocalSandboxProvider.get_external_url(signed)
+        local_https = local_grant or (urlsplit(rewritten).hostname == "host.docker.internal" and urlsplit(rewritten).scheme == "https")
         if local_https:
             await self.write_host_file(local_ca().bundle_path.read_bytes(), "/etc/agentenv-ca-bundle.pem")
         ca = "SSL_CERT_FILE=/etc/agentenv-ca-bundle.pem " if local_https else ""
@@ -78,8 +76,8 @@ class SmolVmSandbox(VmSandbox):
 
     async def write_file_from_url(self, url: str, destination_path: str) -> None:
         vm_path = self._staging_path("url", destination_path)
-        rewritten = _host_url(url)
-        local_https = rewritten != url and urlsplit(url).scheme == "https"
+        rewritten = LocalSandboxProvider.get_external_url(url)
+        local_https = urlsplit(rewritten).hostname == "host.docker.internal" and urlsplit(rewritten).scheme == "https"
         try:
             if local_https:
                 await self.write_host_file(local_ca().bundle_path.read_bytes(), "/etc/agentenv-ca-bundle.pem")
@@ -96,4 +94,6 @@ class SmolVmSandbox(VmSandbox):
     async def reconnect(cls, name: str) -> SmolVmSandbox:
         machine = await asyncio.to_thread(Machine.connect, name, ConnectOptions(target="local", wait_for_ports=False))
         data = await asyncio.to_thread(machine.read_file, _PORTS_FILE)
-        return cls(machine, {int(port): int(host) for port, host in json.loads(data).items()})
+        sandbox = cls(machine, {int(port): int(host) for port, host in json.loads(data).items()})
+        await sandbox.detect_platform()
+        return sandbox
